@@ -1,10 +1,6 @@
-CONFIG = {
+﻿CONFIG = {
     "search": {
         "search_urls": [
-            "https://www.seek.com.au/call-centre-jobs/in-All-Melbourne-VIC?worktype=243%2C245",
-            "https://www.seek.com.au/cashier-job-jobs/in-All-Melbourne-VIC?worktype=243%2C245",
-            "https://www.seek.com.au/retail-assistant-jobs/in-All-Melbourne-VIC?worktype=243%2C245",
-            "https://www.seek.com.au/customer-service-jobs/in-All-Melbourne-VIC?worktype=243%2C245",
             "https://www.seek.com.au/hospitality-jobs/in-All-Melbourne-VIC?worktype=243%2C245",
         ],
         "wait_timeout": 12,
@@ -49,11 +45,11 @@ CONFIG = {
         "min_match_score": 20,
     },
     "apply": {
-        "session_apply_cap": 25,
-        "max_jobs_per_run": 20,
+        "session_apply_cap": 0,
+        "max_jobs_per_run": 0,
         "quick_apply_only": True,
         "skip_external": True,
-        "skip_already_applied": True,
+        "skip_already_applied": False,
         "auto_submit_enabled": True,
         "skip_on_unanswered_questions": True,
         "wait_for_manual_questions": True,
@@ -69,5 +65,7 @@ CONFIG = {
         "show_skip_reasons": True,
     },
 }
+
+
 
 

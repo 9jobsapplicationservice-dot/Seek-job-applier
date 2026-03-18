@@ -7,14 +7,17 @@ import subprocess
 import sys
 import time
 from urllib.request import urlopen
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from datetime import datetime
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
+from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
 
 from config import CONFIG
 
@@ -76,6 +79,8 @@ AFTER_SCREENSHOT_DIR = os.path.join(SCREENSHOT_DIR, "after")
 CSV_LOG_PATH = os.path.join(LOG_DIR, "applied_jobs.csv")
 LAST_HR_TEXT = ""
 LAST_HR_LINK = ""
+TODAY_SUBMITTED_JOB_KEYS = set()
+ACTIVE_APPLY_STATE = {"job_key": "", "job_url": "", "apply_url": "", "locked": False}
 
 BLOCKED_HR_IDENTIFIERS = [
     "agastya",
@@ -163,6 +168,8 @@ def start_debug_chrome(first_url):
         f"--user-data-dir={profile_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
+        "--disable-features=Crashpad",
         first_url,
     ]
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -179,21 +186,178 @@ def start_debug_chrome(first_url):
     return False
 
 
-def init_driver():
+def build_debug_driver():
     chrome_options = Options()
+    chrome_options.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"
+    return webdriver.Chrome(options=chrome_options)
+
+
+class SessionReconnectRequired(RuntimeError):
+    pass
+
+
+def is_session_recoverable_error(exc):
+    if isinstance(exc, InvalidSessionIdException):
+        return True
+    message = normalize_text(str(exc))
+    session_markers = [
+        "invalid session id",
+        "session deleted",
+        "disconnected",
+        "unable to receive message from renderer",
+        "target window already closed",
+        "web view not found",
+        "failed to establish a new connection",
+        "actively refused it",
+        "max retries exceeded",
+        "forcibly closed by the remote host",
+        "connectionreseterror",
+        "winerror 10054",
+        "httppconnectionpool",
+        "httpconnectionpool",
+        "newconnectionerror",
+        "connection refused",
+        "localhost",
+    ]
+    if isinstance(exc, WebDriverException):
+        return any(marker in message for marker in session_markers)
+    return any(marker in message for marker in session_markers)
+
+
+def raise_session_reconnect(exc, context):
+    if is_session_recoverable_error(exc):
+        raise SessionReconnectRequired(context) from exc
+    raise exc
+
+
+def try_quit_driver(driver):
+    if not driver:
+        return
+    try:
+        driver.quit()
+    except Exception:
+        pass
+
+
+def verify_driver_session(driver):
+    if not driver:
+        return False
+    try:
+        _ = driver.current_url
+        return True
+    except Exception as exc:
+        if is_session_recoverable_error(exc):
+            return False
+        return False
+
+
+def clear_active_apply_state():
+    ACTIVE_APPLY_STATE.update({"job_key": "", "job_url": "", "apply_url": "", "locked": False})
+
+
+def lock_active_apply_state(job_key="", job_url="", apply_url=""):
+    ACTIVE_APPLY_STATE["job_key"] = job_key or ACTIVE_APPLY_STATE.get("job_key", "")
+    ACTIVE_APPLY_STATE["job_url"] = job_url or ACTIVE_APPLY_STATE.get("job_url", "")
+    ACTIVE_APPLY_STATE["apply_url"] = apply_url or ACTIVE_APPLY_STATE.get("apply_url", "")
+    ACTIVE_APPLY_STATE["locked"] = True
+    print("APPLY_OPEN:locked")
+
+
+def refresh_active_apply_state(driver, job_key="", job_url=""):
+    if not driver:
+        return False
+    try:
+        current = (driver.current_url or "").strip()
+    except Exception as exc:
+        raise_session_reconnect(exc, "refresh_active_apply_state")
+    if current and has_open_seek_apply_page(driver):
+        ACTIVE_APPLY_STATE["job_key"] = job_key or ACTIVE_APPLY_STATE.get("job_key", "")
+        ACTIVE_APPLY_STATE["job_url"] = job_url or ACTIVE_APPLY_STATE.get("job_url", "")
+        ACTIVE_APPLY_STATE["apply_url"] = current
+        ACTIVE_APPLY_STATE["locked"] = True
+        return True
+    return False
+
+
+def detect_and_lock_seek_apply_page(driver, job_key="", job_url="", switch=True):
+    if not driver:
+        return False
+
+    try:
+        if refresh_active_apply_state(driver, job_key=job_key, job_url=job_url):
+            return True
+    except SessionReconnectRequired:
+        raise
+    except Exception:
+        pass
+
+    if not switch:
+        return False
+
+    try:
+        handles = driver.window_handles
+        current_handle = driver.current_window_handle
+    except Exception as exc:
+        raise_session_reconnect(exc, "detect_and_lock_seek_apply_page_handles")
+
+    for handle in reversed(handles):
+        try:
+            driver.switch_to.window(handle)
+            if refresh_active_apply_state(driver, job_key=job_key, job_url=job_url):
+                return True
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                raise SessionReconnectRequired("detect_and_lock_seek_apply_page_state") from exc
+            continue
+
+    try:
+        driver.switch_to.window(current_handle)
+    except Exception:
+        pass
+    return False
+
+
+def reattach_debug_driver(driver=None, job_url="", context="session"):
+    # Do not quit the attached driver here; with debuggerAddress Chrome can close too.
+    debug_data = get_debug_info(timeout=3)
+    if not debug_data:
+        restart_url = job_url or (SEARCH_URLS[0] if SEARCH_URLS else "")
+        print(f"SESSION_RECOVER:restart_debug:{context}")
+        if not restart_url or not start_debug_chrome(restart_url):
+            print(f"FAILED:session_reconnect:{context}:debug_unavailable")
+            return None
+        debug_data = get_debug_info(timeout=3)
+        if not debug_data:
+            print(f"FAILED:session_reconnect:{context}:debug_unavailable")
+            return None
+    try:
+        driver = build_debug_driver()
+        _ = driver.current_url
+        print("SESSION_RECOVER:reattach")
+        print("Browser:", debug_data.get("Browser"))
+        resume_url = job_url or (ACTIVE_APPLY_STATE.get("apply_url") if ACTIVE_APPLY_STATE.get("locked") else "")
+        if resume_url:
+            driver.get(resume_url)
+            time.sleep(DETAIL_LOAD_WAIT)
+            detect_and_lock_seek_apply_page(driver, job_key=ACTIVE_APPLY_STATE.get("job_key", ""), job_url=ACTIVE_APPLY_STATE.get("job_url", ""))
+        return driver
+    except Exception as exc:
+        print(f"FAILED:session_reconnect:{context}:{exc}")
+        return None
+
+
+def init_driver():
     debug_data = get_debug_info(timeout=3)
 
     if debug_data:
         print("Debug Chrome running")
         print("Browser:", debug_data.get("Browser"))
-        chrome_options.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"
-        return webdriver.Chrome(options=chrome_options)
+        return build_debug_driver()
 
     print("Chrome debug mode running nahi hai; auto-start try kar rahe hain...")
     started = start_debug_chrome(SEARCH_URLS[0])
     if started and get_debug_info(timeout=2):
-        chrome_options.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"
-        return webdriver.Chrome(options=chrome_options)
+        return build_debug_driver()
 
     print("Fresh Chrome session start kiya (debug attach ke bina).")
     return webdriver.Chrome()
@@ -283,6 +447,7 @@ def get_job_entries(driver):
             if not key:
                 continue
             list_applied = False
+            list_quick_apply = False
             try:
                 card = elem.find_element(By.XPATH, "./ancestor::article[1]")
                 card_text = normalize_text(card.text)
@@ -291,11 +456,13 @@ def get_job_entries(driver):
                     or "application sent" in card_text
                     or "you ve applied" in card_text
                 )
+                list_quick_apply = "quick apply" in card_text
             except Exception:
                 list_applied = False
+                list_quick_apply = False
 
             raw.append(
-                {"key": key, "url": href, "title": title, "list_applied": list_applied}
+                {"key": key, "url": href, "title": title, "list_applied": list_applied, "list_quick_apply": list_quick_apply}
             )
         if raw:
             break
@@ -370,9 +537,157 @@ def is_on_apply_interface(driver):
     return False
 
 
+def is_review_submit_page(driver):
+    try:
+        current = (driver.current_url or "").lower()
+        if "/apply/review" in current:
+            return True
+    except Exception as exc:
+        raise_session_reconnect(exc, "is_review_submit_page_url")
+
+    submit_checks = [
+        "//button[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+        "//button[@type='submit'][.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+        "//button[.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+        "//*[@data-testid='submit-application-button']",
+        "//*[@data-automation='submit-application-button']",
+        "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+        "//*[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+        "//button[@data-testid='submit-button']",
+        "//button[@data-automation='submit-button']",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+        "//button[.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]]",
+        "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit your application')]",
+    ]
+    continue_checks = [
+        "//*[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+        "//button[@data-testid='continue-button']",
+        "//button[@data-automation='continue-button']",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+        "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
+        "//*[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+        "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next')]",
+    ]
+    review_checks = [
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'review and submit')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit your application')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'review application')]",
+    ]
+
+    def has_visible(selectors, context):
+        for xp in selectors:
+            try:
+                elems = driver.find_elements(By.XPATH, xp)
+            except Exception as exc:
+                raise_session_reconnect(exc, context)
+            for elem in elems:
+                try:
+                    if elem.is_displayed():
+                        return True
+                except Exception as exc:
+                    if is_session_recoverable_error(exc):
+                        raise SessionReconnectRequired(f"{context}_state") from exc
+                    continue
+        return False
+
+    if has_visible(continue_checks, "is_review_submit_page_continue"):
+        return False
+
+    has_submit = has_visible(submit_checks, "is_review_submit_page_submit")
+    if not has_submit:
+        return False
+    return has_visible(review_checks, "is_review_submit_page_review") or has_submit
+
+
+def get_submit_application_selectors():
+    return [
+        "//button[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+        "//button[@type='submit'][.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+        "//button[.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+        "//*[@data-testid='submit-application-button']",
+        "//*[@data-automation='submit-application-button']",
+        "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+        "//*[self::button or self::a][contains(@class, 'Button') and .//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+    ]
+
+
+def hard_submit_application(driver):
+    selectors = get_submit_application_selectors()
+    if not any_visible_selector(driver, selectors):
+        return False
+    if click_first_match(driver, selectors):
+        return True
+
+    try:
+        submitted = driver.execute_script(
+            """
+            const selectors = [
+              'button[type="submit"]',
+              '[data-testid="submit-application-button"]',
+              '[data-automation="submit-application-button"]',
+              'button'
+            ];
+            const norm = value => (value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            for (const selector of selectors) {
+              for (const el of document.querySelectorAll(selector)) {
+                const text = norm((el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || ''));
+                if (!text.includes('submit application')) continue;
+                el.scrollIntoView({block: 'center', inline: 'nearest'});
+                try { el.click(); } catch (e) {}
+                try { ['mousedown','mouseup','click'].forEach(name => el.dispatchEvent(new MouseEvent(name, {bubbles:true,cancelable:true,view:window}))); } catch (e) {}
+                const form = el.form || el.closest('form');
+                if (form) {
+                  try { if (form.requestSubmit) { form.requestSubmit(el); } else { form.submit(); } } catch (e) {}
+                }
+                return true;
+              }
+            }
+            return false;
+            """
+        )
+        return bool(submitted)
+    except Exception as exc:
+        raise_session_reconnect(exc, "hard_submit_application")
+
+
+def is_seek_domain(url):
+    try:
+        host = (urlparse(url).netloc or "").lower()
+    except Exception:
+        return False
+    return host.endswith("seek.com.au") or host.endswith("www.seek.com.au")
+
+
+def classify_apply_target(target_url, attrs_text=""):
+    url = (target_url or "").strip()
+    attrs = normalize_text(attrs_text)
+    if any(marker in attrs for marker in ["advertiser s site", "apply on company site", "external site", "apply with seek"]):
+        return "external_handoff"
+    if not url:
+        if "quick apply" in attrs:
+            return "seek_in_site"
+        if "apply with seek" in attrs:
+            return "external_handoff"
+        return "unknown"
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if host and not is_seek_domain(url):
+        return "external_handoff"
+    if is_seek_domain(url) and "/job/" in path and "/apply" in path:
+        return "seek_in_site"
+    if is_seek_domain(url) and "/job/" in path:
+        return "seek_job"
+    return "external_handoff" if host else "unknown"
+
+
 def build_apply_url(job_url):
     url = (job_url or "").strip()
-    if not url:
+    if not url or not is_seek_domain(url):
         return ""
 
     base = url.split("?")[0]
@@ -389,29 +704,124 @@ def build_apply_url(job_url):
 def wait_for_apply_interface(driver, timeout=6):
     end_time = time.time() + timeout
     while time.time() < end_time:
-        if is_on_apply_interface(driver):
-            return True
+        try:
+            if is_on_apply_interface(driver):
+                return True
+        except Exception as exc:
+            raise_session_reconnect(exc, "wait_for_apply_interface")
         time.sleep(0.1)
     return False
+
+
+def has_open_seek_apply_page(driver):
+    try:
+        current = (driver.current_url or "").strip()
+    except Exception as exc:
+        raise_session_reconnect(exc, "has_open_seek_apply_page")
+
+    if classify_apply_target(current, current) == "seek_in_site":
+        return True
+    return is_on_apply_interface(driver)
 
 
 def wait_for_apply_transition(driver, original_url, timeout=12):
     end_time = time.time() + timeout
+    baseline_url = (original_url or "").lower()
     while time.time() < end_time:
-        current = (driver.current_url or "").lower()
-        if is_on_apply_interface(driver):
-            return True
-        if current != (original_url or "").lower() and "/apply" in current:
-            return True
+        try:
+            current = (driver.current_url or "").lower()
+            if has_open_seek_apply_page(driver):
+                return True
+            if current != baseline_url and "/apply" in current and is_seek_domain(current):
+                return True
+        except Exception as exc:
+            raise_session_reconnect(exc, "wait_for_apply_transition")
         time.sleep(0.1)
     return False
 
 
+def classify_current_location(driver):
+    try:
+        current = (driver.current_url or "").strip()
+    except Exception as exc:
+        raise_session_reconnect(exc, "classify_current_location")
+    if not current:
+        return "unknown"
+    return classify_apply_target(current, current)
+
+
+def find_seek_window_handle(driver):
+    try:
+        handles = driver.window_handles
+        current_handle = driver.current_window_handle
+    except Exception as exc:
+        raise_session_reconnect(exc, "find_seek_window_handle")
+    for handle in handles:
+        try:
+            driver.switch_to.window(handle)
+            current_url = (driver.current_url or "").strip()
+            if is_seek_domain(current_url) or current_url.lower().startswith("chrome://"):
+                return handle
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                raise SessionReconnectRequired("find_seek_window_handle_state") from exc
+            continue
+    try:
+        driver.switch_to.window(current_handle)
+    except Exception:
+        pass
+    return ""
+
+
+def close_external_target_and_return(driver, original_handle=None):
+    host = ""
+    try:
+        current = (driver.current_url or "").strip()
+        host = (urlparse(current).netloc or "").lower()
+    except Exception:
+        current = ""
+    try:
+        handles = driver.window_handles
+    except Exception as exc:
+        raise_session_reconnect(exc, "close_external_target_handles")
+
+    if original_handle and len(handles) > 1:
+        try:
+            current_handle = driver.current_window_handle
+            if current_handle != original_handle:
+                driver.close()
+                remaining_handles = driver.window_handles
+                if original_handle in remaining_handles:
+                    driver.switch_to.window(original_handle)
+                else:
+                    seek_handle = find_seek_window_handle(driver)
+                    if seek_handle:
+                        driver.switch_to.window(seek_handle)
+                return True, host
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                return False, host
+            raise_session_reconnect(exc, "close_external_target_close_tab")
+
+    try:
+        if driver.execute_script("return window.history.length"):
+            driver.back()
+            time.sleep(CLICK_PAUSE)
+            return False, host
+    except Exception as exc:
+        if is_session_recoverable_error(exc):
+            return False, host
+    return False, host
+
+
 def switch_to_new_tab_if_any(driver):
-    handles = driver.window_handles
-    if len(handles) <= 1:
-        return
-    driver.switch_to.window(handles[-1])
+    try:
+        handles = driver.window_handles
+        if len(handles) <= 1:
+            return
+        driver.switch_to.window(handles[-1])
+    except Exception as exc:
+        raise_session_reconnect(exc, "switch_to_new_tab")
 
 
 def click_apply(driver, job_url):
@@ -435,26 +845,39 @@ def click_apply(driver, job_url):
 
     saw_candidate = False
     saw_quick_candidate = False
-    origin_url = driver.current_url
+    try:
+        origin_url = driver.current_url
+        origin_handle = driver.current_window_handle
+    except Exception as exc:
+        raise_session_reconnect(exc, "click_apply_origin")
+
     for xp in possible:
-        elems = driver.find_elements(By.XPATH, xp)
+        try:
+            elems = driver.find_elements(By.XPATH, xp)
+        except Exception as exc:
+            raise_session_reconnect(exc, "click_apply_find")
         for btn in elems:
             try:
                 if not btn.is_displayed() or not btn.is_enabled():
                     continue
-            except Exception:
+            except Exception as exc:
+                if is_session_recoverable_error(exc):
+                    raise SessionReconnectRequired("click_apply_button_state") from exc
                 continue
 
-            attrs = " ".join(
-                [
-                    btn.text or "",
-                    btn.get_attribute("aria-label") or "",
-                    btn.get_attribute("title") or "",
-                    btn.get_attribute("data-automation") or "",
-                    btn.get_attribute("data-testid") or "",
-                    btn.get_attribute("href") or "",
-                ]
-            )
+            try:
+                attrs = " ".join(
+                    [
+                        btn.text or "",
+                        btn.get_attribute("aria-label") or "",
+                        btn.get_attribute("title") or "",
+                        btn.get_attribute("data-automation") or "",
+                        btn.get_attribute("data-testid") or "",
+                        btn.get_attribute("href") or "",
+                    ]
+                )
+            except Exception as exc:
+                raise_session_reconnect(exc, "click_apply_button_attrs")
             text_btn = normalize_text(attrs)
             is_quick_signal = "quick apply" in text_btn
             if QUICK_APPLY_ONLY and not is_quick_signal:
@@ -463,7 +886,14 @@ def click_apply(driver, job_url):
             saw_candidate = True
             if is_quick_signal:
                 saw_quick_candidate = True
-            btn_href = (btn.get_attribute("href") or "").strip()
+            try:
+                btn_href = (btn.get_attribute("href") or "").strip()
+            except Exception as exc:
+                raise_session_reconnect(exc, "click_apply_button_href")
+
+            target_kind = classify_apply_target(btn_href, attrs)
+            if target_kind == "external_handoff":
+                return "external_target"
 
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
@@ -471,43 +901,93 @@ def click_apply(driver, job_url):
                 print("APPLY_CLICK:normal")
                 time.sleep(CLICK_PAUSE)
                 switch_to_new_tab_if_any(driver)
-                if wait_for_apply_transition(driver, origin_url, timeout=12):
+                if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
                     return "opened"
-            except Exception:
-                pass
+                current_kind = classify_current_location(driver)
+                if current_kind == "external_handoff" or is_external_apply(driver):
+                    closed_tab, host = close_external_target_and_return(driver, origin_handle)
+                    print(f"SKIP_EXTERNAL_HOST:{host or 'unknown'}")
+                    return "external_target_closed_tab" if closed_tab else "external_target"
+                if wait_for_apply_transition(driver, origin_url, timeout=12) and detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
+                    return "opened"
+            except Exception as exc:
+                if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
+                    return "opened"
+                if is_session_recoverable_error(exc):
+                    raise SessionReconnectRequired("apply_click_normal") from exc
 
             try:
                 driver.execute_script("arguments[0].click();", btn)
                 print("APPLY_CLICK:js")
                 time.sleep(CLICK_PAUSE)
                 switch_to_new_tab_if_any(driver)
-                if wait_for_apply_transition(driver, origin_url, timeout=12):
+                if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
                     return "opened"
-            except Exception:
-                pass
+                current_kind = classify_current_location(driver)
+                if current_kind == "external_handoff" or is_external_apply(driver):
+                    closed_tab, host = close_external_target_and_return(driver, origin_handle)
+                    print(f"SKIP_EXTERNAL_HOST:{host or 'unknown'}")
+                    return "external_target_closed_tab" if closed_tab else "external_target"
+                if wait_for_apply_transition(driver, origin_url, timeout=12) and detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
+                    return "opened"
+            except Exception as exc:
+                if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
+                    return "opened"
+                if is_session_recoverable_error(exc):
+                    raise SessionReconnectRequired("apply_click_js") from exc
 
-            if btn_href and "/apply" in btn_href:
+            if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                print("APPLY_OPEN:detected_interface")
+                return "opened"
+
+            if btn_href and "/apply" in btn_href and classify_apply_target(btn_href, attrs) == "seek_in_site" and not detect_and_lock_seek_apply_page(driver, job_url=job_url, switch=False):
                 try:
                     driver.get(btn_href)
                     print("APPLY_CLICK:href")
-                    if wait_for_apply_transition(driver, origin_url, timeout=10):
+                    current_kind = classify_current_location(driver)
+                    if current_kind == "external_handoff" or is_external_apply(driver):
+                        closed_tab, host = close_external_target_and_return(driver, origin_handle)
+                        print(f"SKIP_EXTERNAL_HOST:{host or 'unknown'}")
+                        return "external_target_closed_tab" if closed_tab else "external_target"
+                    if detect_and_lock_seek_apply_page(driver, job_url=job_url) or wait_for_apply_transition(driver, origin_url, timeout=10):
+                        detect_and_lock_seek_apply_page(driver, job_url=job_url)
                         print(f"APPLY_BUTTON_HREF:{btn_href}")
                         return "opened"
-                except Exception:
-                    pass
+                except Exception as exc:
+                    if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                        print("APPLY_OPEN:detected_interface")
+                        return "opened"
+                    if is_session_recoverable_error(exc):
+                        raise SessionReconnectRequired("apply_click_href") from exc
 
-    allow_fallback = DIRECT_APPLY_URL_FALLBACK and (not QUICK_APPLY_ONLY or saw_quick_candidate)
+    allow_fallback = DIRECT_APPLY_URL_FALLBACK and (not QUICK_APPLY_ONLY or saw_quick_candidate) and not detect_and_lock_seek_apply_page(driver, job_url=job_url, switch=False)
     if allow_fallback:
         apply_url = build_apply_url(job_url)
-        if apply_url:
+        if apply_url and classify_apply_target(apply_url, "quick apply") == "seek_in_site":
             try:
                 driver.get(apply_url)
                 print("APPLY_CLICK:fallback_url")
-                if wait_for_apply_transition(driver, origin_url, timeout=10):
+                current_kind = classify_current_location(driver)
+                if current_kind == "external_handoff" or is_external_apply(driver):
+                    closed_tab, host = close_external_target_and_return(driver, origin_handle)
+                    print(f"SKIP_EXTERNAL_HOST:{host or 'unknown'}")
+                    return "external_target_closed_tab" if closed_tab else "external_precheck"
+                if detect_and_lock_seek_apply_page(driver, job_url=job_url) or wait_for_apply_transition(driver, origin_url, timeout=10):
+                    detect_and_lock_seek_apply_page(driver, job_url=job_url)
                     print(f"APPLY_FALLBACK_URL:{apply_url}")
                     return "opened"
-            except Exception:
-                pass
+            except Exception as exc:
+                if detect_and_lock_seek_apply_page(driver, job_url=job_url):
+                    print("APPLY_OPEN:detected_interface")
+                    return "opened"
+                if is_session_recoverable_error(exc):
+                    raise SessionReconnectRequired("apply_click_fallback") from exc
 
     if QUICK_APPLY_ONLY and not saw_quick_candidate:
         non_quick_selectors = [
@@ -517,35 +997,138 @@ def click_apply(driver, job_url):
             "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'apply')]",
         ]
         for xp in non_quick_selectors:
-            elems = driver.find_elements(By.XPATH, xp)
+            try:
+                elems = driver.find_elements(By.XPATH, xp)
+            except Exception as exc:
+                raise_session_reconnect(exc, "click_apply_non_quick_find")
             for elem in elems:
                 try:
                     text = normalize_text(elem.text)
                     if elem.is_displayed() and "apply" in text and "quick apply" not in text:
                         return "not_quick_apply"
-                except Exception:
+                except Exception as exc:
+                    if is_session_recoverable_error(exc):
+                        raise SessionReconnectRequired("click_apply_non_quick_state") from exc
                     continue
 
     if saw_candidate:
         return "visible_but_not_opened"
     return "not_found"
 
+
 def click_first_match(driver, selectors):
+    candidates = []
+    seen_ids = set()
     for xp in selectors:
-        elems = driver.find_elements(By.XPATH, xp)
+        try:
+            elems = driver.find_elements(By.XPATH, xp)
+        except Exception as exc:
+            raise_session_reconnect(exc, "click_first_match_find")
         for elem in elems:
             try:
-                if not elem.is_displayed() or not elem.is_enabled():
-                    continue
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
+                candidate = elem
                 try:
-                    elem.click()
+                    resolved = driver.execute_script(
+                        'const el=arguments[0]; return el && el.closest ? el.closest("button, a, [role=\"button\"], input[type=\"submit\"], input[type=\"button\"]") : el;',
+                        elem,
+                    )
+                    if resolved is not None:
+                        candidate = resolved
                 except Exception:
-                    driver.execute_script("arguments[0].click();", elem)
-                time.sleep(CLICK_PAUSE)
-                return True
-            except Exception:
+                    candidate = elem
+
+                if not candidate.is_displayed() or not candidate.is_enabled():
+                    continue
+                elem_id = getattr(candidate, "id", None) or id(candidate)
+                if elem_id in seen_ids:
+                    continue
+                seen_ids.add(elem_id)
+                tag = (candidate.tag_name or "").lower()
+                elem_type = (candidate.get_attribute("type") or "").lower()
+                text_blob = normalize_text(" ".join([
+                    candidate.text or "",
+                    candidate.get_attribute("aria-label") or "",
+                    candidate.get_attribute("title") or "",
+                    candidate.get_attribute("data-testid") or "",
+                    candidate.get_attribute("data-automation") or "",
+                ]))
+                y = 0
+                x = 0
+                width = 0
+                height = 0
+                try:
+                    location = candidate.location_once_scrolled_into_view or {}
+                    size = candidate.size or {}
+                    y = int(location.get("y", 0))
+                    x = int(location.get("x", 0))
+                    width = int(size.get("width", 0))
+                    height = int(size.get("height", 0))
+                except Exception:
+                    pass
+                priority = 0
+                if tag == "button":
+                    priority += 25
+                if elem_type == "submit":
+                    priority += 35
+                if tag == "a":
+                    priority -= 10
+                if width >= 80 and height >= 28:
+                    priority += 10
+                if text_blob == "submit application":
+                    priority += 60
+                elif "submit application" in text_blob:
+                    priority += 45
+                elif text_blob == "submit":
+                    priority += 35
+                elif "submit" in text_blob:
+                    priority += 25
+                elif text_blob == "continue":
+                    priority += 30
+                elif "continue" in text_blob:
+                    priority += 20
+                elif "next" in text_blob:
+                    priority += 15
+                candidates.append((priority, y, width * height, candidate, text_blob))
+            except Exception as exc:
+                if is_session_recoverable_error(exc):
+                    raise SessionReconnectRequired("click_first_match_collect") from exc
                 continue
+
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    for _priority, _y, _area, elem, text_blob in candidates:
+        try:
+            block = "end" if any(token in text_blob for token in ("continue", "submit", "next", "review")) else "center"
+            driver.execute_script("arguments[0].scrollIntoView({block: arguments[1], inline: 'nearest'});", elem, block)
+            try:
+                elem.click()
+            except Exception:
+                try:
+                    ActionChains(driver).move_to_element(elem).pause(0.1).click(elem).perform()
+                except Exception:
+                    try:
+                        driver.execute_script("arguments[0].click();", elem)
+                    except Exception:
+                        try:
+                            driver.execute_script(
+                                "const el=arguments[0]; ['mousedown','mouseup','click'].forEach(name => el.dispatchEvent(new MouseEvent(name, {bubbles:true,cancelable:true,view:window})));",
+                                elem,
+                            )
+                        except Exception:
+                            try:
+                                elem.send_keys(Keys.ENTER)
+                            except Exception:
+                                submitted = driver.execute_script(
+                                    "const el=arguments[0]; const form=el.form || el.closest('form'); if(form){ if(form.requestSubmit){ form.requestSubmit(el); } else { form.submit(); } return true; } return false;",
+                                    elem,
+                                )
+                                if not submitted:
+                                    raise
+            time.sleep(CLICK_PAUSE)
+            return True
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                raise SessionReconnectRequired("click_first_match_click") from exc
+            continue
     return False
 
 
@@ -589,16 +1172,132 @@ def select_resume_if_present(driver, target_name="Agastya Resume.pdf"):
     return False
 
 
+def get_field_context_text(driver, elem):
+    try:
+        text = driver.execute_script(
+            """
+            const el = arguments[0];
+            const container = el.closest('fieldset, section, form, div');
+            return (container ? container.innerText : (el.innerText || el.textContent || '')) || '';
+            """,
+            elem,
+        )
+    except Exception as exc:
+        raise_session_reconnect(exc, "get_field_context_text")
+    return normalize_text(text)
+
+
+def select_first_matching_option(select_elem, match_tokens):
+    try:
+        sel = Select(select_elem)
+        options = sel.options
+    except Exception:
+        return False
+
+    for option in options:
+        text = normalize_text(option.text)
+        value = normalize_text(option.get_attribute("value") or "")
+        if not text or text in ("select", "select one", "please select"):
+            continue
+        if any(token in text or token in value for token in match_tokens):
+            try:
+                sel.select_by_visible_text(option.text)
+                return True
+            except Exception:
+                try:
+                    sel.select_by_value(option.get_attribute("value") or "")
+                    return True
+                except Exception:
+                    continue
+    return False
+
+
+def answer_common_select_questions(driver):
+    changed = False
+    try:
+        selects = driver.find_elements(By.XPATH, "//select[not(@disabled)]")
+    except Exception as exc:
+        raise_session_reconnect(exc, "answer_common_select_questions_find")
+
+    for select_elem in selects:
+        try:
+            if not select_elem.is_displayed() or not select_elem.is_enabled():
+                continue
+            current_value = normalize_text(select_elem.get_attribute("value") or "")
+            selected_text = ""
+            try:
+                selected_text = normalize_text(Select(select_elem).first_selected_option.text)
+            except Exception:
+                selected_text = ""
+            if current_value and selected_text not in ("", "select", "select one", "please select"):
+                continue
+
+            context = get_field_context_text(driver, select_elem)
+            if not context:
+                continue
+
+            if any(token in context for token in ["right to work", "work rights", "work in australia", "visa"]):
+                if select_first_matching_option(select_elem, ["temporary visa", "student visa", "restrictions on work hours"]):
+                    print("EMPLOYER_Q:work_rights=temp_visa")
+                    changed = True
+                    continue
+
+            if any(token in context for token in ["years experience", "how many years", "experience do you have"]):
+                if select_first_matching_option(select_elem, ["0", "0-1", "less than 1", "under 1", "1 year", "1-2"]):
+                    print("EMPLOYER_Q:experience=conservative")
+                    changed = True
+                    continue
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                raise SessionReconnectRequired("answer_common_select_questions_state") from exc
+            continue
+    return changed
+
+
+def click_visible_label_choice(driver, label_text):
+    xpath = f"//label[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{label_text}')]"
+    try:
+        elems = driver.find_elements(By.XPATH, xpath)
+    except Exception as exc:
+        raise_session_reconnect(exc, "click_visible_label_choice_find")
+
+    for elem in elems:
+        try:
+            if not elem.is_displayed():
+                continue
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
+            try:
+                elem.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", elem)
+            time.sleep(0.2)
+            return True
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                raise SessionReconnectRequired("click_visible_label_choice_state") from exc
+            continue
+    return False
+
+
 def answer_known_employer_questions(driver):
+    text = normalize_text(driver.page_source)
+    changed = False
+
+    changed = answer_common_select_questions(driver) or changed
+
+    if "rsa" in text or "responsible service of alcohol" in text:
+        if click_visible_label_choice(driver, "no"):
+            print("EMPLOYER_Q:rsa=no")
+            changed = True
+
     yes_selectors = [
         "//label[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'yes')]",
         "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'yes')]",
     ]
     keywords = ["driver", "driver's licence", "right to work", "work rights", "australia"]
-    text = normalize_text(driver.page_source)
     matched = any(k in text for k in keywords)
     if not matched:
-        return False
+        return changed
 
     for xp in yes_selectors:
         elems = driver.find_elements(By.XPATH, xp)
@@ -616,7 +1315,7 @@ def answer_known_employer_questions(driver):
                 return True
             except Exception:
                 continue
-    return False
+    return changed
 
 
 def has_unanswered_required_questions(driver):
@@ -639,7 +1338,69 @@ def has_unanswered_required_questions(driver):
                     return True
             except Exception:
                 continue
+
+    radio_group_script = """
+    const groups = new Map();
+    const radios = Array.from(document.querySelectorAll('input[type="radio"]:not([disabled])'));
+    for (const radio of radios) {
+      const name = radio.name || radio.id;
+      if (!name) continue;
+      const required = radio.required || radio.getAttribute('aria-required') === 'true';
+      if (!required) continue;
+      const visible = !!(radio.offsetWidth || radio.offsetHeight || radio.getClientRects().length);
+      if (!visible) continue;
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push(radio);
+    }
+    for (const items of groups.values()) {
+      if (!items.some(r => r.checked)) return true;
+    }
+    return false;
+    """
+    try:
+        if driver.execute_script(radio_group_script):
+            return True
+    except Exception as exc:
+        raise_session_reconnect(exc, "has_unanswered_required_questions_radios")
     return False
+
+
+
+def prepare_active_application(driver):
+    select_resume_if_present(driver, "Agastya Resume.pdf")
+    answer_known_employer_questions(driver)
+    return handle_resume_upload(driver)
+
+
+def get_apply_page_signature(driver, phase=None):
+    try:
+        current = (driver.current_url or "").lower().strip()
+        action = get_primary_action_name(driver, phase or get_current_flow_phase(driver))
+        main_text = ""
+        for xp in ["//main", "//*[@data-automation='application-form']", "//*[@data-testid='application-form']"]:
+            elems = driver.find_elements(By.XPATH, xp)
+            for elem in elems:
+                try:
+                    if not elem.is_displayed():
+                        continue
+                    main_text = normalize_text(elem.text)[:800]
+                    if main_text:
+                        break
+                except Exception as exc:
+                    if is_session_recoverable_error(exc):
+                        raise SessionReconnectRequired("get_apply_page_signature_state") from exc
+                    continue
+            if main_text:
+                break
+        return "|".join([
+            current,
+            phase or "",
+            action,
+            "questions" if is_employer_questions_step(driver) else "no_questions",
+            main_text,
+        ])
+    except Exception as exc:
+        raise_session_reconnect(exc, "get_apply_page_signature")
 
 
 def find_autoit_binary():
@@ -921,6 +1682,30 @@ def extract_hr_details(text_blob):
     return hr_name, hr_email, hr_contact
 
 
+def load_today_submitted_job_keys():
+    today = datetime.now().strftime("%d-%m-%Y")
+    submitted = set()
+    if not os.path.exists(CSV_LOG_PATH):
+        return submitted
+    try:
+        with open(CSV_LOG_PATH, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                if (row.get("status") or "").strip().lower() != "submitted":
+                    continue
+                if (row.get("date") or "").strip() != today:
+                    continue
+                job_link = (row.get("job_link") or "").strip()
+                key = extract_job_key_from_href(job_link)
+                if key:
+                    submitted.add(key)
+    except Exception:
+        return submitted
+    return submitted
+
+
 def append_apply_log(
     company_name,
     position,
@@ -1020,24 +1805,16 @@ def wait_for_manual_required_answers(driver):
             last_ping = now
         time.sleep(interval)
 
-def run_quick_apply_flow(driver):
-    step_selectors = [
-        (
-            "SUBMIT_APPLICATION",
-            [
-                "//*[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
-                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
-                "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
-                "//button[@data-testid='submit-application-button']",
-                "//button[@data-automation='submit-application-button']",
-            ],
-        ),
+def get_quick_apply_step_selectors():
+    pre_review_steps = [
         (
             "CONTINUE",
             [
+                "//button[@type='submit'][.//text()[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]]",
                 "//*[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
                 "//button[@data-testid='continue-button']",
                 "//button[@data-automation='continue-button']",
+                "//button[contains(@aria-label, 'Continue')]",
                 "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
                 "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'continue')]",
             ],
@@ -1058,14 +1835,32 @@ def run_quick_apply_flow(driver):
                 "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'review')]",
             ],
         ),
+    ]
+    review_submit_steps = [
+        (
+            "SUBMIT_APPLICATION",
+            [
+                "//button[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+                "//button[@type='submit'][.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+                "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+                "//button[.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]]",
+                "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+                "//*[@data-testid='submit-application-button']",
+                "//*[@data-automation='submit-application-button']",
+                "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit application')]",
+            ],
+        ),
         (
             "SUBMIT",
             [
-                "//*[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
-                "//button[@data-testid='submit-button']",
-                "//button[@data-automation='submit-button']",
+                "//button[@type='submit' and contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+                "//button[@type='submit'][.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]]",
+                "//*[@data-testid='submit-button']",
+                "//*[@data-automation='submit-button']",
                 "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+                "//button[.//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]]",
                 "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
+                "//button[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'submit')]",
             ],
         ),
         (
@@ -1077,59 +1872,220 @@ def run_quick_apply_flow(driver):
             ],
         ),
     ]
+    return {"pre_review": pre_review_steps, "review_submit": review_submit_steps}
 
-    retries = 0
-    while retries < MAX_FLOW_STEPS:
-        if is_external_apply(driver):
-            return "external"
 
-        if is_application_submitted(driver):
-            return "submitted"
+def get_current_flow_phase(driver):
+    if is_review_submit_page(driver):
+        return "review_submit"
+    return "pre_review"
 
-        # Hard lock on employer questions when required fields are still pending.
-        # This prevents "continue" click spam while user fills answers manually.
-        if is_employer_questions_step(driver) and has_unanswered_required_questions(driver):
-            manual_state = wait_for_manual_required_answers(driver)
-            if manual_state == "submitted":
-                return "submitted"
-            if manual_state == "resolved":
-                retries = 0
+
+def any_visible_selector(driver, selectors):
+    for xp in selectors:
+        try:
+            elems = driver.find_elements(By.XPATH, xp)
+        except Exception as exc:
+            raise_session_reconnect(exc, "any_visible_selector")
+        for elem in elems:
+            try:
+                if elem.is_displayed() and elem.is_enabled():
+                    return True
+            except Exception as exc:
+                if is_session_recoverable_error(exc):
+                    raise SessionReconnectRequired("any_visible_selector_state") from exc
                 continue
+    return False
 
-        progressed = False
-        for step_name, selectors in step_selectors:
-            if click_first_match(driver, selectors):
-                print(f"FLOW_STEP:{step_name}")
-                progressed = True
-                if is_application_submitted(driver):
-                    return "submitted"
-                break
 
-        if progressed:
-            retries = 0
-            time.sleep(CLICK_PAUSE)
+def get_primary_cta_sequence():
+    step_groups = get_quick_apply_step_selectors()
+    selector_map = {}
+    for group_steps in step_groups.values():
+        for step_name, selectors in group_steps:
+            selector_map[step_name] = selectors
+    ordered_steps = ["SUBMIT_APPLICATION", "SUBMIT", "CONTINUE", "NEXT", "REVIEW", "YES"]
+    return [(step_name, selector_map.get(step_name, [])) for step_name in ordered_steps if selector_map.get(step_name)]
+
+
+def get_primary_action_name(driver, phase=None):
+    phase = phase or get_current_flow_phase(driver)
+    step_groups = get_quick_apply_step_selectors()
+    pre_review_steps = step_groups.get("pre_review", [])
+    submit_steps = step_groups.get("review_submit", [])
+
+    for step_name, selectors in pre_review_steps:
+        if any_visible_selector(driver, selectors):
+            return step_name
+
+    if phase == "review_submit":
+        for step_name, selectors in submit_steps:
+            if any_visible_selector(driver, selectors):
+                return step_name
+    else:
+        for step_name, selectors in submit_steps:
+            if any_visible_selector(driver, selectors):
+                return step_name
+    return ""
+
+
+def get_primary_action_selectors(step_name):
+    for name, selectors in get_primary_cta_sequence():
+        if name == step_name:
+            return selectors
+    return []
+
+
+def should_prepare_active_application(driver):
+    return not is_review_submit_page(driver)
+
+
+def wait_for_step_progress(driver, before_url, before_phase, before_action, before_signature="", before_question_state=False, timeout=4):
+    end_time = time.time() + timeout
+    baseline = (before_url or "").lower()
+    while time.time() < end_time:
+        try:
+            if is_application_submitted(driver):
+                return True
+            current = (driver.current_url or "").lower()
+            current_phase = get_current_flow_phase(driver)
+            current_action = get_primary_action_name(driver, current_phase)
+            current_question_state = is_employer_questions_step(driver)
+            current_signature = get_apply_page_signature(driver, current_phase)
+            if current != baseline:
+                return True
+            if current_phase != before_phase:
+                return True
+            if current_question_state != before_question_state:
+                return True
+            if current_action and current_action != before_action:
+                return True
+            if before_signature and current_signature != before_signature:
+                return True
+        except Exception as exc:
+            raise_session_reconnect(exc, "wait_for_step_progress")
+        time.sleep(0.15)
+    return False
+
+
+def run_quick_apply_flow(driver):
+    idle_cycles = 0
+    last_wait_log = 0
+    same_page_count = 0
+    same_review_page_count = 0
+    prepared_signatures = set()
+    while True:
+        try:
+            refresh_active_apply_state(driver)
+            if is_external_apply(driver):
+                return "external"
+
             if is_application_submitted(driver):
                 return "submitted"
-            continue
 
-        print("FLOW_WAIT:no_action")
-        if SKIP_ON_UNANSWERED_QUESTIONS and has_unanswered_required_questions(driver):
-            manual_state = wait_for_manual_required_answers(driver)
-            if manual_state == "submitted":
-                return "submitted"
-            if manual_state == "resolved":
-                retries = 0
+            phase = get_current_flow_phase(driver)
+            current_signature = get_apply_page_signature(driver, phase)
+            if phase == "review_submit":
+                print("FLOW_PHASE:review_submit")
+            if should_prepare_active_application(driver) and current_signature not in prepared_signatures:
+                if not prepare_active_application(driver):
+                    return "resume_upload_failed"
+                prepared_signatures.add(current_signature)
+                current_signature = get_apply_page_signature(driver, phase)
+
+            if is_employer_questions_step(driver) and has_unanswered_required_questions(driver):
+                print("APPLY_WAIT:manual_questions")
+                manual_state = wait_for_manual_required_answers(driver)
+                if manual_state == "submitted":
+                    return "submitted"
+                if manual_state == "resolved":
+                    idle_cycles = 0
+                    continue
+
+            progressed = False
+            clicked_step = False
+            step_name = get_primary_action_name(driver, phase)
+            if not step_name and detect_and_lock_seek_apply_page(driver, switch=False):
+                phase = get_current_flow_phase(driver)
+                step_name = get_primary_action_name(driver, phase)
+            selectors = get_primary_action_selectors(step_name)
+            if phase == "review_submit" and any_visible_selector(driver, get_submit_application_selectors()):
+                step_name = "SUBMIT_APPLICATION"
+                selectors = get_submit_application_selectors()
+            if step_name:
+                before_url = driver.current_url
+                before_action = step_name
+                before_question_state = is_employer_questions_step(driver)
+                before_signature = current_signature
+                if step_name in ("CONTINUE", "NEXT", "REVIEW") and not has_unanswered_required_questions(driver):
+                    print(f"FLOW_ADVANCE:primary_cta={step_name}")
+                elif step_name in ("SUBMIT_APPLICATION", "SUBMIT"):
+                    print(f"FLOW_ADVANCE:primary_cta={step_name}")
+                clicked = False
+                if step_name == "SUBMIT_APPLICATION":
+                    clicked = hard_submit_application(driver)
+                else:
+                    clicked = click_first_match(driver, selectors)
+                if clicked:
+                    clicked_step = True
+                    print(f"FLOW_STEP:{step_name}")
+                    advanced = wait_for_step_progress(
+                        driver,
+                        before_url,
+                        before_phase=phase,
+                        before_action=before_action,
+                        before_signature=before_signature,
+                        before_question_state=before_question_state,
+                        timeout=max(2.5, DETAIL_LOAD_WAIT * 5),
+                    )
+                    if advanced:
+                        progressed = True
+                        idle_cycles = 0
+                        same_page_count = 0
+                        same_review_page_count = 0
+                    elif step_name in ("SUBMIT_APPLICATION", "SUBMIT", "YES") or phase == "review_submit":
+                        same_review_page_count += 1
+                        print(f"FLOW_WAIT:same_review_page:{same_review_page_count}")
+                    else:
+                        same_page_count += 1
+                        print(f"FLOW_WAIT:same_page:{same_page_count}")
+                    if is_application_submitted(driver):
+                        return "submitted"
+
+            if progressed:
+                time.sleep(CLICK_PAUSE)
+                if is_application_submitted(driver):
+                    return "submitted"
                 continue
-            return "blocked_questions"
 
-        retries += 1
-        time.sleep(0.5)
+            if clicked_step:
+                time.sleep(CLICK_PAUSE)
 
-    if is_application_submitted(driver):
-        return "submitted"
-    if SKIP_ON_UNANSWERED_QUESTIONS and has_unanswered_required_questions(driver):
-        return "blocked_questions"
-    return "blocked"
+            if SKIP_ON_UNANSWERED_QUESTIONS and has_unanswered_required_questions(driver):
+                print("APPLY_WAIT:required_questions")
+                manual_state = wait_for_manual_required_answers(driver)
+                if manual_state == "submitted":
+                    return "submitted"
+                if manual_state == "resolved":
+                    idle_cycles = 0
+                    continue
+                return "blocked_questions"
+
+            idle_cycles += 1
+            now = time.time()
+            current = driver.current_url
+            if idle_cycles == 1 or now - last_wait_log >= 15:
+                if is_on_apply_interface(driver):
+                    print(f"FLOW_WAIT:in_progress:idle={idle_cycles}:url={current}")
+                else:
+                    print(f"FLOW_WAIT:awaiting_apply_state:idle={idle_cycles}:url={current}")
+                last_wait_log = now
+            if MAX_FLOW_STEPS > 0 and idle_cycles >= MAX_FLOW_STEPS:
+                return "blocked"
+            time.sleep(max(0.5, DETAIL_LOAD_WAIT))
+        except Exception as exc:
+            raise_session_reconnect(exc, "run_quick_apply_flow")
+
 
 def log_match_result(job_key, title, match_result):
     if not SHOW_MATCH_DETAILS:
@@ -1153,126 +2109,182 @@ def process_job_url(driver, job_entry, idx, stats):
     job_key = job_entry["key"]
     job_title = job_entry["title"]
 
-    print(f"OPEN:{idx}:{job_title}")
-    try:
-        driver.get(job_url)
-        time.sleep(DETAIL_LOAD_WAIT)
-    except Exception as e:
-        print(f"FAILED:{job_key}:open_job:{e}")
-        stats["failed"] += 1
-        append_apply_log("Unknown", job_title, job_url, "failed_open_job", "", "")
-        return job_key
+    attempts = 2
+    for attempt in range(attempts):
+        try:
+            if attempt > 0:
+                print(f"SESSION_RECOVER:retry_job:{job_key}")
 
-    company_name, position = extract_company_and_position(driver, job_title)
+            if not verify_driver_session(driver):
+                raise SessionReconnectRequired("pre_job_check")
 
-    if SKIP_EXTERNAL and is_external_apply(driver):
-        if SHOW_SKIP_REASONS:
-            print(f"SKIP_EXTERNAL:{job_key}")
-        stats["skipped_external"] += 1
-        append_apply_log(company_name, position, job_url, "skipped_external", "", "")
-        return job_key
+            active_apply_url = ""
+            if ACTIVE_APPLY_STATE.get("locked") and ACTIVE_APPLY_STATE.get("job_key") == job_key:
+                active_apply_url = ACTIVE_APPLY_STATE.get("apply_url") or ""
+            target_url = active_apply_url or job_url
 
-    if SKIP_ALREADY_APPLIED and is_already_applied(driver):
-        if SHOW_SKIP_REASONS:
-            print(f"SKIP_APPLIED:{job_key}")
-        stats["skipped_applied"] += 1
-        append_apply_log(company_name, position, job_url, "skipped_applied", "", "")
-        return job_key
+            print(f"OPEN:{idx}:{job_title}")
+            driver.get(target_url)
+            time.sleep(DETAIL_LOAD_WAIT)
 
-    title_text, detail_text = get_job_text_snapshot(driver)
-    LAST_HR_TEXT = build_hr_context_text(driver, title_text, detail_text)
-    LAST_HR_LINK = extract_hr_profile_link(driver)
-    match_result = evaluate_match(title_text, detail_text)
-    log_match_result(job_key, title_text, match_result)
+            company_name, position = extract_company_and_position(driver, job_title)
 
-    if MATCHING_ENABLED and not match_result["eligible"]:
-        if SHOW_SKIP_REASONS:
-            print(
-                "SKIP_LOW_MATCH:"
-                f"score={match_result['score']} "
-                f"min={MIN_MATCH_SCORE} "
-                f"missing={match_result['missing_must_have']} "
-                f"excluded={match_result['excluded_term_hit']}"
-            )
-        stats["skipped_low_match"] += 1
-        append_apply_log(company_name, position, job_url, "skipped_low_match", "", "")
-        return job_key
+            if SKIP_EXTERNAL and is_external_apply(driver):
+                if SHOW_SKIP_REASONS:
+                    print(f"SKIP_EXTERNAL:{job_key}")
+                stats["skipped_external"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_external", "", "")
+                clear_active_apply_state()
+                return job_key, driver
 
-    if not MATCHING_ENABLED and SHOW_MATCH_DETAILS:
-        print("MATCH_BYPASS:matching.enabled=False")
+            title_text, detail_text = get_job_text_snapshot(driver)
+            LAST_HR_TEXT = build_hr_context_text(driver, title_text, detail_text)
+            LAST_HR_LINK = extract_hr_profile_link(driver)
+            match_result = evaluate_match(title_text, detail_text)
+            log_match_result(job_key, title_text, match_result)
 
-    apply_state = click_apply(driver, job_url)
-    if apply_state in ("not_found", "not_quick_apply"):
-        print(f"SKIP_NO_QUICK_APPLY:{job_key}")
-        stats["skipped_no_quick_apply"] += 1
-        append_apply_log(company_name, position, job_url, "skipped_no_quick_apply", "", "")
-        return job_key
+            if MATCHING_ENABLED and not match_result["eligible"]:
+                if SHOW_SKIP_REASONS:
+                    print(
+                        "SKIP_LOW_MATCH:"
+                        f"score={match_result['score']} "
+                        f"min={MIN_MATCH_SCORE} "
+                        f"missing={match_result['missing_must_have']} "
+                        f"excluded={match_result['excluded_term_hit']}"
+                    )
+                stats["skipped_low_match"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_low_match", "", "")
+                return job_key, driver
 
-    if apply_state == "visible_but_not_opened":
-        print(f"FAILED:{job_key}:quick_apply_transition")
-        stats["failed"] += 1
-        append_apply_log(company_name, position, job_url, "failed_quick_apply_transition", "", "")
-        return job_key
+            if not MATCHING_ENABLED and SHOW_MATCH_DETAILS:
+                print("MATCH_BYPASS:matching.enabled=False")
 
-    if not is_on_apply_interface(driver):
-        print(f"FAILED:{job_key}:quick_apply_interface_not_opened")
-        stats["failed"] += 1
-        append_apply_log(company_name, position, job_url, "failed_quick_apply_interface", "", "")
-        return job_key
+            before_shot = capture_job_screenshot(driver, job_key, "before_apply", phase="before")
 
-    before_shot = capture_job_screenshot(driver, job_key, "before_apply", phase="before")
+            apply_state = click_apply(driver, job_url)
+            if apply_state == "external_precheck":
+                print(f"SKIP_EXTERNAL_PRECHECK:{job_key}")
+                stats["skipped_external"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_external_precheck", "", "")
+                return job_key, driver
 
-    select_resume_if_present(driver, "Agastya Resume.pdf")
-    answer_known_employer_questions(driver)
+            if apply_state == "external_target":
+                print(f"SKIP_EXTERNAL_TARGET:{job_key}")
+                stats["skipped_external"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_external_target", "", "")
+                return job_key, driver
 
-    if not handle_resume_upload(driver):
-        print(f"FAILED:{job_key}:resume_upload")
-        stats["failed"] += 1
-        append_apply_log(company_name, position, job_url, "failed_resume_upload", "", "")
-        return job_key
+            if apply_state == "external_target_closed_tab":
+                print(f"SKIP_EXTERNAL_TARGET:{job_key}:closed_tab")
+                stats["skipped_external"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_external_target_closed_tab", "", "")
+                return job_key, driver
 
-    if not AUTO_SUBMIT_ENABLED:
-        print("AUTO_SUBMIT_DISABLED")
-        append_apply_log(company_name, position, job_url, "auto_submit_disabled", "", "")
-        return job_key
+            if apply_state in ("not_found", "not_quick_apply"):
+                print(f"SKIP_NO_QUICK_APPLY:{job_key}")
+                stats["skipped_no_quick_apply"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_no_quick_apply", "", "")
+                return job_key, driver
 
-    result = run_quick_apply_flow(driver)
-    if result == "submitted":
-        print(f"SUBMITTED:{job_key}")
-        stats["applied"] += 1
-        confirm_deadline = time.time() + 1.0
-        while time.time() < confirm_deadline:
-            if is_application_submitted(driver):
-                break
-            time.sleep(0.2)
-        shot = capture_job_screenshot(driver, job_key, "submitted", phase="after")
-        hr_name, hr_email, hr_contact = extract_hr_details(LAST_HR_TEXT)
-        append_apply_log(
-            company_name,
-            position,
-            job_url,
-            "submitted",
-            shot,
-            before_shot,
-            hr_name,
-            hr_email,
-            hr_contact,
-            LAST_HR_LINK,
-        )
-    elif result == "external":
-        print(f"SKIP_EXTERNAL:{job_key}")
-        stats["skipped_external"] += 1
-        append_apply_log(company_name, position, job_url, "skipped_external", "", "")
-    elif result == "blocked_questions":
-        print(f"FAILED:{job_key}:blocked_questions")
-        stats["failed"] += 1
-        append_apply_log(company_name, position, job_url, "failed_blocked_questions", "", "")
-    else:
-        print(f"FAILED:{job_key}:blocked_or_incomplete")
-        stats["failed"] += 1
-        append_apply_log(company_name, position, job_url, "failed_blocked_or_incomplete", "", "")
+            if apply_state == "visible_but_not_opened":
+                print(f"FAILED:{job_key}:quick_apply_transition")
+                stats["failed"] += 1
+                append_apply_log(company_name, position, job_url, "failed_quick_apply_transition", "", "")
+                return job_key, driver
 
-    return job_key
+            if not is_on_apply_interface(driver) and not wait_for_apply_interface(driver, timeout=max(6, WAIT_TIMEOUT)):
+                print(f"FAILED:{job_key}:quick_apply_interface_not_opened")
+                stats["failed"] += 1
+                clear_active_apply_state()
+                append_apply_log(company_name, position, job_url, "failed_quick_apply_interface", "", "")
+                return job_key, driver
+
+            refresh_active_apply_state(driver, job_key=job_key, job_url=job_url)
+
+            if not AUTO_SUBMIT_ENABLED:
+                print("AUTO_SUBMIT_DISABLED")
+                append_apply_log(company_name, position, job_url, "auto_submit_disabled", "", "")
+                return job_key, driver
+
+            result = run_quick_apply_flow(driver)
+            if result == "submitted":
+                print(f"SUBMITTED:{job_key}")
+                stats["applied"] += 1
+                TODAY_SUBMITTED_JOB_KEYS.add(job_key)
+                confirm_deadline = time.time() + 1.0
+                while time.time() < confirm_deadline:
+                    if is_application_submitted(driver):
+                        break
+                    time.sleep(0.2)
+                shot = capture_job_screenshot(driver, job_key, "submitted", phase="after")
+                hr_name, hr_email, hr_contact = extract_hr_details(LAST_HR_TEXT)
+                append_apply_log(
+                    company_name,
+                    position,
+                    job_url,
+                    "submitted",
+                    shot,
+                    before_shot,
+                    hr_name,
+                    hr_email,
+                    hr_contact,
+                    LAST_HR_LINK,
+                )
+                clear_active_apply_state()
+            elif result == "external":
+                print(f"SKIP_EXTERNAL:{job_key}")
+                stats["skipped_external"] += 1
+                append_apply_log(company_name, position, job_url, "skipped_external", "", "")
+                clear_active_apply_state()
+            elif result == "blocked_questions":
+                print(f"FAILED:{job_key}:blocked_questions")
+                stats["failed"] += 1
+                append_apply_log(company_name, position, job_url, "failed_blocked_questions", "", "")
+                clear_active_apply_state()
+            elif result == "resume_upload_failed":
+                print(f"FAILED:{job_key}:resume_upload")
+                stats["failed"] += 1
+                append_apply_log(company_name, position, job_url, "failed_resume_upload", "", "")
+                clear_active_apply_state()
+            else:
+                print(f"FAILED:{job_key}:blocked_or_incomplete")
+                stats["failed"] += 1
+                append_apply_log(company_name, position, job_url, "failed_blocked_or_incomplete", "", "")
+                clear_active_apply_state()
+
+            return job_key, driver
+        except SessionReconnectRequired as exc:
+            context = str(exc) or "session_reconnect"
+        except Exception as exc:
+            if is_session_recoverable_error(exc):
+                context = "unexpected_session_loss"
+            else:
+                print(f"FAILED:{job_key}:unexpected:{exc}")
+                stats["failed"] += 1
+                append_apply_log("Unknown", job_title, job_url, "failed_unexpected", "", "")
+                clear_active_apply_state()
+                return job_key, driver
+
+        if attempt + 1 >= attempts:
+            print(f"FAILED:session_reconnect:{job_key}:{context}")
+            stats["failed"] += 1
+            append_apply_log("Unknown", job_title, job_url, "failed_session_reconnect", "", "")
+            clear_active_apply_state()
+            return job_key, driver
+
+        resume_url = ACTIVE_APPLY_STATE.get("apply_url") if ACTIVE_APPLY_STATE.get("locked") and ACTIVE_APPLY_STATE.get("job_key") == job_key else ""
+        if resume_url:
+            print("SESSION_RECOVER:resume_active_apply")
+        recovered_driver = reattach_debug_driver(driver, job_url=resume_url or job_url, context=f"{job_key}:{context}")
+        if recovered_driver is None:
+            print(f"FAILED:session_reconnect:{job_key}:{context}")
+            stats["failed"] += 1
+            append_apply_log("Unknown", job_title, job_url, "failed_session_reconnect", "", "")
+            clear_active_apply_state()
+            return job_key, driver
+        driver = recovered_driver
+
+    return job_key, driver
 
 
 def go_to_next_results_page(driver):
@@ -1302,6 +2314,9 @@ def apply_cap_reached(stats):
 
 
 def run_continuous(driver):
+    global TODAY_SUBMITTED_JOB_KEYS
+    TODAY_SUBMITTED_JOB_KEYS = load_today_submitted_job_keys()
+
     stats = {
         "pages": 0,
         "scanned": 0,
@@ -1365,24 +2380,39 @@ def run_continuous(driver):
                     print(f"SKIP_DUPLICATE:{key}")
                     continue
 
-                if SKIP_ALREADY_APPLIED and entry.get("list_applied"):
-                    print(f"SKIP_APPLIED:{key}:list_badge")
+                if key in TODAY_SUBMITTED_JOB_KEYS:
+                    print(f"SKIP_APPLIED_TODAY:{key}")
                     stats["scanned"] += 1
                     scanned_this_search += 1
                     stats["skipped_applied"] += 1
-                    append_apply_log("Unknown", entry.get("title", "Unknown"), entry.get("url", ""), "skipped_applied", "", "")
                     processed_global.add(key)
                     page_processed += 1
                     continue
 
                 stats["scanned"] += 1
                 scanned_this_search += 1
-                result_key = process_job_url(driver, entry, idx, stats)
+                result_key, driver = process_job_url(driver, entry, idx, stats)
                 processed_global.add(result_key or key)
                 page_processed += 1
 
-                driver.get(results_page_url)
-                time.sleep(PAGE_LOAD_WAIT)
+                if ACTIVE_APPLY_STATE.get("locked"):
+                    continue
+
+                try:
+                    driver.get(results_page_url)
+                    time.sleep(PAGE_LOAD_WAIT)
+                except Exception as exc:
+                    if is_session_recoverable_error(exc):
+                        resume_url = ACTIVE_APPLY_STATE.get("apply_url") if ACTIVE_APPLY_STATE.get("locked") else ""
+                        if resume_url:
+                            print("SESSION_RECOVER:resume_active_apply")
+                        recovered_driver = reattach_debug_driver(driver, job_url=resume_url or results_page_url, context="results_page")
+                        if recovered_driver is None:
+                            print("STOP:results_page_session_lost")
+                            return
+                        driver = recovered_driver
+                    else:
+                        raise
 
             if apply_cap_reached(stats):
                 break
