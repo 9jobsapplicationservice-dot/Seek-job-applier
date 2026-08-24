@@ -19,7 +19,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
-from selenium.common.exceptions import InvalidSessionIdException, SessionNotCreatedException, WebDriverException
+from selenium.common.exceptions import InvalidSessionIdException, SessionNotCreatedException, TimeoutException, WebDriverException
 
 from config import CONFIG
 
@@ -47,6 +47,8 @@ MAX_FLOW_STEPS = int(SEARCH_CFG.get("max_flow_steps", 20))
 MAX_PAGES_PER_SEARCH = int(SEARCH_CFG.get("max_pages_per_search", 0))
 SALARY_TOLERANCE = int(SEARCH_CFG.get("salary_tolerance", 1000))
 RESULTS_PAGE_READY_TIMEOUT = float(SEARCH_CFG.get("results_page_ready_timeout_sec", 20))
+DRIVER_COMMAND_TIMEOUT = max(15.0, float(SEARCH_CFG.get("driver_command_timeout_sec", 30)))
+DRIVER_PAGELOAD_TIMEOUT = max(15.0, float(SEARCH_CFG.get("driver_pageload_timeout_sec", 30)))
 
 SESSION_APPLY_CAP = int(APPLY_CFG.get("session_apply_cap", 25))
 QUICK_APPLY_ONLY = bool(APPLY_CFG.get("quick_apply_only", True))
@@ -112,8 +114,6 @@ EXPERIENCE_STRICT = bool(MATCHING_CFG.get("experience_strict", True))
 
 LOG_DIR = os.path.join(os.getcwd(), "logs")
 SCREENSHOT_DIR = os.path.join(LOG_DIR, "screenshots")
-BEFORE_SCREENSHOT_DIR = os.path.join(SCREENSHOT_DIR, "before")
-AFTER_SCREENSHOT_DIR = os.path.join(SCREENSHOT_DIR, "after")
 CSV_LOG_PATH = os.path.join(LOG_DIR, "applied_jobs.csv")
 EVALUATION_CSV_LOG_PATH = os.path.join(LOG_DIR, "job_evaluation_log.csv")
 LAST_HR_TEXT = ""
@@ -292,14 +292,59 @@ def start_debug_chrome(first_url):
     return False
 
 
+def configure_driver_runtime(driver):
+    if not driver:
+        return driver
+    try:
+        driver.set_page_load_timeout(DRIVER_PAGELOAD_TIMEOUT)
+    except Exception:
+        pass
+    try:
+        driver.set_script_timeout(DRIVER_COMMAND_TIMEOUT)
+    except Exception:
+        pass
+    try:
+        if getattr(driver, "command_executor", None) and hasattr(driver.command_executor, "set_timeout"):
+            driver.command_executor.set_timeout(DRIVER_COMMAND_TIMEOUT)
+    except Exception:
+        pass
+    return driver
+
+
+def get_driver_title_safe(driver):
+    if not driver:
+        return ""
+    try:
+        return driver.title
+    except TimeoutException:
+        return ""
+    except Exception as exc:
+        if is_session_recoverable_error(exc):
+            return ""
+        raise
+
+
+def get_driver_current_url_safe(driver):
+    if not driver:
+        return ""
+    try:
+        return driver.current_url
+    except TimeoutException:
+        return ""
+    except Exception as exc:
+        if is_session_recoverable_error(exc):
+            return ""
+        raise
+
+
 def build_debug_driver():
     chrome_options = Options()
     chrome_options.debugger_address = f"{DEBUG_HOST}:{DEBUG_PORT}"
     debug_data = get_debug_info(timeout=2)
     chromedriver_path = find_local_chromedriver(extract_browser_version(debug_data))
     if chromedriver_path and os.path.exists(chromedriver_path):
-        return webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options)
-    return webdriver.Chrome(options=chrome_options)
+        return configure_driver_runtime(webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options))
+    return configure_driver_runtime(webdriver.Chrome(options=chrome_options))
 
 
 def build_standard_driver(start_url=""):
@@ -323,9 +368,9 @@ def build_standard_driver(start_url=""):
     chromedriver_path = find_local_chromedriver()
     try:
         if chromedriver_path and os.path.exists(chromedriver_path):
-            driver = webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options)
+            driver = configure_driver_runtime(webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=chrome_options))
         else:
-            driver = webdriver.Chrome(options=chrome_options)
+            driver = configure_driver_runtime(webdriver.Chrome(options=chrome_options))
     except SessionNotCreatedException:
         retry_options = Options()
         if chrome_binary:
@@ -346,9 +391,9 @@ def build_standard_driver(start_url=""):
         retry_options.add_argument("--disable-extensions")
         retry_options.add_argument("--start-maximized")
         if chromedriver_path and os.path.exists(chromedriver_path):
-            driver = webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=retry_options)
+            driver = configure_driver_runtime(webdriver.Chrome(service=ChromeService(executable_path=chromedriver_path), options=retry_options))
         else:
-            driver = webdriver.Chrome(options=retry_options)
+            driver = configure_driver_runtime(webdriver.Chrome(options=retry_options))
     if start_url:
         driver.get(start_url)
     return driver
@@ -405,7 +450,7 @@ def verify_driver_session(driver):
     if not driver:
         return False
     try:
-        _ = driver.current_url
+        _ = get_driver_current_url_safe(driver)
         return True
     except Exception as exc:
         if is_session_recoverable_error(exc):
@@ -438,6 +483,35 @@ def build_cover_letter_text(template_text, company_name="", position=""):
     return text
 
 
+def rewrite_cover_letter_for_current_job(existing_text, company_name="", position=""):
+    text = build_cover_letter_text(existing_text, company_name, position).strip()
+    company = (company_name or "").strip()
+    role = (position or "").strip()
+
+    if not text or not company or not role:
+        return text
+
+    intro_patterns = [
+        r"(i am writing to express my interest in\s+)(?:the\s+)?(.+?)(?:\s+position)?\s+at\s+(.+?)([,\.\n])",
+        r"(i am excited to apply for\s+)(?:the\s+)?(.+?)(?:\s+position|\s+role)?\s+at\s+(.+?)([,\.\n])",
+        r"(i would like to apply for\s+)(?:the\s+)?(.+?)(?:\s+position|\s+role)?\s+at\s+(.+?)([,\.\n])",
+    ]
+    replacement = f"\\1the {role} at {company}\\4"
+
+    for pattern in intro_patterns:
+        updated, count = re.subn(pattern, replacement, text, count=1, flags=re.IGNORECASE | re.DOTALL)
+        if count:
+            return updated.strip()
+
+    if company not in text or role.lower() not in text.lower():
+        return (
+            f"Hi,\n\n"
+            f"I am writing to express my interest in the {role} at {company}.\n\n"
+            f"{text}"
+        ).strip()
+    return text
+
+
 def lock_active_apply_state(job_key="", job_url="", apply_url=""):
     ACTIVE_APPLY_STATE["job_key"] = job_key or ACTIVE_APPLY_STATE.get("job_key", "")
     ACTIVE_APPLY_STATE["job_url"] = job_url or ACTIVE_APPLY_STATE.get("job_url", "")
@@ -450,7 +524,7 @@ def refresh_active_apply_state(driver, job_key="", job_url=""):
     if not driver:
         return False
     try:
-        current = (driver.current_url or "").strip()
+        current = (get_driver_current_url_safe(driver) or "").strip()
     except Exception as exc:
         raise_session_reconnect(exc, "refresh_active_apply_state")
     if current and has_open_seek_apply_page(driver):
@@ -535,12 +609,24 @@ def init_driver():
     if debug_data:
         print("Debug Chrome running")
         print("Browser:", debug_data.get("Browser"))
-        return build_debug_driver()
+        try:
+            driver = build_debug_driver()
+            if verify_driver_session(driver):
+                return driver
+            print("WARN: debug driver attach unhealthy; fresh session try karenge")
+        except Exception as exc:
+            print(f"WARN: debug driver attach failed: {exc}")
 
     print("Chrome debug mode running nahi hai; auto-start try kar rahe hain...")
     started = start_debug_chrome(STARTUP_URL or (SEARCH_URLS[0] if SEARCH_URLS else "https://www.seek.com.au/"))
     if started and get_debug_info(timeout=2):
-        return build_debug_driver()
+        try:
+            driver = build_debug_driver()
+            if verify_driver_session(driver):
+                return driver
+            print("WARN: auto-start debug attach unhealthy; fresh session use hoga")
+        except Exception as exc:
+            print(f"WARN: auto-start debug attach failed: {exc}")
 
     print("Fresh Chrome session start kiya (debug attach ke bina).")
     return build_standard_driver(STARTUP_URL or "https://www.seek.com.au/")
@@ -2745,6 +2831,73 @@ def get_field_context_text(driver, elem):
     return normalize_text(text)
 
 
+def set_input_value(driver, elem, value):
+    fill_value = str(value or "")
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", elem)
+    except Exception:
+        pass
+
+    script = """
+    const el = arguments[0];
+    const value = arguments[1];
+    el.focus();
+    el.value = '';
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.value = value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+    """
+    try:
+        driver.execute_script(script, elem, fill_value)
+    except Exception as exc:
+        if is_session_recoverable_error(exc):
+            raise SessionReconnectRequired("set_input_value_script") from exc
+        try:
+            elem.clear()
+        except Exception:
+            pass
+        try:
+            elem.send_keys(fill_value)
+        except Exception as inner_exc:
+            if is_session_recoverable_error(inner_exc):
+                raise SessionReconnectRequired("set_input_value_send_keys") from inner_exc
+            return False
+
+    try:
+        updated_value = (elem.get_attribute("value") or elem.text or "").strip()
+    except Exception as exc:
+        if is_session_recoverable_error(exc):
+            raise SessionReconnectRequired("set_input_value_verify") from exc
+        updated_value = ""
+    return normalize_text(updated_value) == normalize_text(fill_value)
+
+
+def refresh_active_job_context_from_page(driver):
+    if not hasattr(driver, "find_elements"):
+        return ACTIVE_JOB_CONTEXT.get("company_name", ""), ACTIVE_JOB_CONTEXT.get("position", "")
+
+    fallback_company = ACTIVE_JOB_CONTEXT.get("company_name", "")
+    fallback_position = ACTIVE_JOB_CONTEXT.get("position", "")
+    company_name, position = extract_company_and_position(driver, fallback_position)
+
+    if normalize_text(company_name) == "unknown":
+        company_name = fallback_company
+    if normalize_text(position) == "unknown":
+        position = fallback_position
+
+    set_active_job_context(company_name, position)
+    return company_name, position
+
+
+def is_cover_letter_context(context):
+    context_text = normalize_text(context)
+    hints = ["cover letter", "message to employer", "message for the employer", "why are you interested"]
+    return any(hint in context_text for hint in hints)
+
+
 def get_configured_answer_for_context(context, answers=None):
     context_text = normalize_text(context)
     configured_answers = dict(JOB_FILTERS_CFG)
@@ -2876,23 +3029,31 @@ def answer_common_input_questions(driver):
         try:
             if not elem.is_displayed() or not elem.is_enabled():
                 continue
-            
+
             current_value = (elem.get_attribute("value") or elem.text or "").strip()
-            if current_value:
-                continue
-            
             context = get_field_context_text(driver, elem)
             field_name, answer_tokens = get_configured_answer_for_context(context)
-            if not answer_tokens:
-                continue
-            
-            if field_name == "keywords":
-                fill_value = ", ".join(answer_tokens)
-            elif field_name == "cover_letter":
-                fill_value = "\n".join(answer_tokens)
+            if field_name == "cover_letter" or (not field_name and current_value and is_cover_letter_context(context)):
+                company_name = ACTIVE_JOB_CONTEXT.get("company_name", "")
+                position = ACTIVE_JOB_CONTEXT.get("position", "")
+                source_text = "\n".join(answer_tokens).strip() if answer_tokens else current_value
+                fill_value = rewrite_cover_letter_for_current_job(source_text, company_name, position)
+                if not fill_value:
+                    continue
+                if normalize_text(current_value) == normalize_text(fill_value):
+                    continue
+                field_name = "cover_letter"
             else:
-                fill_value = answer_tokens[0]
-            
+                if current_value or not answer_tokens:
+                    continue
+                if field_name == "keywords":
+                    fill_value = ", ".join(answer_tokens)
+                else:
+                    fill_value = answer_tokens[0]
+
+            if not fill_value:
+                continue
+
             if set_input_value(driver, elem, fill_value):
                 print(f"EMPLOYER_Q:{field_name}={fill_value}")
                 time.sleep(0.1)
@@ -3080,6 +3241,7 @@ def has_unanswered_required_questions(driver):
 
 
 def prepare_active_application(driver):
+    refresh_active_job_context_from_page(driver)
     select_resume_if_present(driver, os.path.basename(RESUME_FILE or ""))
     answer_known_employer_questions(driver)
     return handle_resume_upload(driver)
@@ -3194,9 +3356,8 @@ def handle_resume_upload(driver):
 
 
 def ensure_log_paths():
-    os.makedirs(BEFORE_SCREENSHOT_DIR, exist_ok=True)
-    os.makedirs(AFTER_SCREENSHOT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     if not ENABLE_EVALUATION_CSV and os.path.exists(EVALUATION_CSV_LOG_PATH):
         try:
             os.remove(EVALUATION_CSV_LOG_PATH)
@@ -3273,12 +3434,32 @@ def safe_filename(value):
     return clean.strip("_") or "job"
 
 
+def get_screenshot_phase_dir(phase="after", current_time=None):
+    stamp_source = current_time or datetime.now()
+    dated_dir = os.path.join(SCREENSHOT_DIR, stamp_source.strftime("%Y-%m-%d"))
+    if phase == "pending_before":
+        phase_dir = os.path.join(dated_dir, "_pending_before")
+    else:
+        phase_dir = os.path.join(dated_dir, "before" if phase == "before" else "after")
+    os.makedirs(phase_dir, exist_ok=True)
+    return phase_dir
+
+
+def get_next_screenshot_path(phase="after", current_time=None):
+    target_dir = get_screenshot_phase_dir(phase=phase, current_time=current_time)
+    highest = 0
+    for name in os.listdir(target_dir):
+        stem, ext = os.path.splitext(name)
+        if ext.lower() != ".png":
+            continue
+        if stem.isdigit():
+            highest = max(highest, int(stem))
+    return os.path.join(target_dir, f"{highest + 1}.png")
+
+
 def capture_job_screenshot(driver, job_key, status, phase="after"):
     ensure_log_paths()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = f"{stamp}_{safe_filename(job_key)}_{safe_filename(status)}.png"
-    target_dir = BEFORE_SCREENSHOT_DIR if phase == "before" else AFTER_SCREENSHOT_DIR
-    out_path = os.path.join(target_dir, fname)
+    out_path = get_next_screenshot_path(phase=phase)
     try:
         driver.save_screenshot(out_path)
         return out_path
@@ -3286,14 +3467,102 @@ def capture_job_screenshot(driver, job_key, status, phase="after"):
         return ""
 
 
+def capture_job_screenshot_to_path(driver, out_path):
+    if not driver or not out_path:
+        return ""
+    ensure_log_paths()
+    try:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        driver.save_screenshot(out_path)
+        return out_path
+    except Exception:
+        return ""
+
+
+def finalize_submission_screenshots(driver, before_pending_path, job_key):
+    ensure_log_paths()
+    after_path = get_next_screenshot_path(phase="after")
+    file_name = os.path.basename(after_path)
+    before_path = os.path.join(get_screenshot_phase_dir(phase="before"), file_name)
+    saved_after_path = capture_job_screenshot_to_path(driver, after_path)
+    saved_before_path = ""
+    if before_pending_path and os.path.exists(before_pending_path):
+        try:
+            os.replace(before_pending_path, before_path)
+            saved_before_path = before_path
+        except OSError:
+            saved_before_path = ""
+    return saved_before_path, saved_after_path
+
+
+def is_job_start_screenshot_ready(driver):
+    if not driver:
+        return False
+    title_selectors = [
+        "//h1[normalize-space(.)!='']",
+        "//*[@data-automation='job-detail-title'][normalize-space(.)!='']",
+        "//*[@data-testid='job-title'][normalize-space(.)!='']",
+    ]
+    try:
+        current = (driver.current_url or "").strip().lower()
+    except Exception:
+        current = ""
+    if "/apply" in current:
+        return False
+    return any_visible_selector(driver, title_selectors)
+
+
+def wait_for_job_start_screenshot_ready(driver, timeout=6):
+    end_time = time.time() + max(1, float(timeout))
+    while time.time() < end_time:
+        try:
+            try:
+                driver.execute_script("window.scrollTo(0, 0);")
+            except Exception:
+                pass
+            if is_job_start_screenshot_ready(driver):
+                return True
+        except Exception as exc:
+            raise_session_reconnect(exc, "wait_for_job_start_screenshot_ready")
+        time.sleep(0.1)
+    return is_job_start_screenshot_ready(driver)
+
+
+def capture_job_start_screenshot(driver, job_key):
+    if not driver:
+        return ""
+    wait_for_job_start_screenshot_ready(driver, timeout=max(2, DETAIL_LOAD_WAIT * 6))
+    try:
+        driver.execute_script("window.scrollTo(0, 0);")
+    except Exception:
+        pass
+    time.sleep(0.2)
+    return capture_job_screenshot(driver, job_key, "before_apply", phase="pending_before")
+
+
+def remove_screenshot_file(path):
+    target = (path or "").strip()
+    if not target:
+        return False
+    try:
+        if os.path.exists(target):
+            os.remove(target)
+            return True
+    except OSError:
+        return False
+    return False
+
+
 def extract_company_and_position(driver, fallback_title):
-    position = (fallback_title or "").strip()
+    fallback_position = (fallback_title or "").strip()
+    position = ""
     company = ""
 
     title_selectors = [
-        "//h1",
         "//*[@data-automation='job-detail-title']",
         "//*[@data-testid='job-title']",
+        "//h1[normalize-space(.)!='']",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'applying for')]/following::*[self::h1 or self::h2 or self::div or self::span][normalize-space(.)!=''][1]",
     ]
     for xp in title_selectors:
         elems = driver.find_elements(By.XPATH, xp)
@@ -3310,22 +3579,26 @@ def extract_company_and_position(driver, fallback_title):
         "//*[@data-testid='advertiser-name']",
         "//a[contains(@href, '/companies/') and normalize-space(.)!='']",
         "//span[contains(@data-automation, 'advertiser') and normalize-space(.)!='']",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'applying for')]/following::*[normalize-space(.)!=''][2]",
     ]
     for xp in company_selectors:
         elems = driver.find_elements(By.XPATH, xp)
         for elem in elems:
             c = (elem.text or "").strip()
-            if c:
+            if c and normalize_text(c) != normalize_text(position):
                 company = c
                 break
         if company:
             break
 
     if not company:
-        text_blob = (driver.page_source or "")[:2000]
+        text_blob = (driver.page_source or "")[:4000]
         m = re.search(r"by\s+([A-Za-z0-9 &.,'-]{2,60})", text_blob)
         if m:
             company = m.group(1).strip()
+
+    if not position:
+        position = fallback_position
 
     return company or "Unknown", position or "Unknown"
 
@@ -3842,7 +4115,7 @@ def wait_for_step_progress(driver, before_url, before_phase, before_action, befo
     return False
 
 
-def run_quick_apply_flow(driver):
+def run_quick_apply_flow(driver, job_key="", artifact_state=None):
     idle_cycles = 0
     last_wait_log = 0
     same_page_count = 0
@@ -4117,7 +4390,7 @@ def process_job_url(driver, job_entry, idx, stats):
             elif not MATCHING_ENABLED and SHOW_MATCH_DETAILS:
                 print("MATCH_BYPASS:matching.enabled=False")
 
-            before_shot = capture_job_screenshot(driver, job_key, "before_apply", phase="before")
+            artifact_state = {"before_screenshot": capture_job_start_screenshot(driver, job_key)}
 
             apply_state = click_apply(driver, job_url, is_quick_apply=job_entry.get("list_quick_apply", False), expected_title=position)
             if apply_state == "external_precheck":
@@ -4179,9 +4452,10 @@ def process_job_url(driver, job_entry, idx, stats):
                 append_apply_log(company_name, position, job_url, "auto_submit_disabled", "", "")
                 return job_key, driver
 
-            result = run_quick_apply_flow(driver)
+            result = run_quick_apply_flow(driver, job_key=job_key, artifact_state=artifact_state)
             if result == "submitted":
                 if not confirm_application_submission(driver, timeout=max(6, WAIT_TIMEOUT)):
+                    remove_screenshot_file(artifact_state.get("before_screenshot", ""))
                     print(f"FAILED:{job_key}:submission_not_confirmed")
                     stats["failed"] += 1
                     append_evaluation_log(job_url, company_name, position, "FAILED", "failed_submission_not_confirmed", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
@@ -4191,7 +4465,7 @@ def process_job_url(driver, job_entry, idx, stats):
                 print(f"SUBMITTED:{job_key}")
                 stats["applied"] += 1
                 TODAY_SUBMITTED_JOB_KEYS.add(job_key)
-                shot = capture_job_screenshot(driver, job_key, "submitted", phase="after")
+                before_shot, shot = finalize_submission_screenshots(driver, artifact_state.get("before_screenshot", ""), job_key)
                 hr_name, hr_email, hr_contact = extract_hr_details(LAST_HR_TEXT)
                 append_apply_log(
                     company_name,
@@ -4228,24 +4502,28 @@ def process_job_url(driver, job_entry, idx, stats):
                 )
                 clear_active_apply_state()
             elif result == "external":
+                remove_screenshot_file(artifact_state.get("before_screenshot", ""))
                 print(f"SKIP_EXTERNAL:{job_key}")
                 stats["skipped_external"] += 1
                 append_evaluation_log(job_url, company_name, position, "SKIP", "skipped_external", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
                 append_apply_log(company_name, position, job_url, "skipped_external", "", "")
                 clear_active_apply_state()
             elif result == "blocked_questions":
+                remove_screenshot_file(artifact_state.get("before_screenshot", ""))
                 print(f"FAILED:{job_key}:blocked_questions")
                 stats["failed"] += 1
                 append_evaluation_log(job_url, company_name, position, "FAILED", "failed_blocked_questions", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
                 append_apply_log(company_name, position, job_url, "failed_blocked_questions", "", "")
                 clear_active_apply_state()
             elif result == "resume_upload_failed":
+                remove_screenshot_file(artifact_state.get("before_screenshot", ""))
                 print(f"FAILED:{job_key}:resume_upload")
                 stats["failed"] += 1
                 append_evaluation_log(job_url, company_name, position, "FAILED", "failed_resume_upload", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
                 append_apply_log(company_name, position, job_url, "failed_resume_upload", "", "")
                 clear_active_apply_state()
             else:
+                remove_screenshot_file(artifact_state.get("before_screenshot", ""))
                 print(f"FAILED:{job_key}:blocked_or_incomplete")
                 stats["failed"] += 1
                 append_evaluation_log(job_url, company_name, position, "FAILED", "failed_blocked_or_incomplete", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
@@ -4481,8 +4759,8 @@ def main():
         if QUICK_APPLY_ONLY:
             print("QUICK_ONLY_MODE:on")
         print("Connected successfully")
-        print("Current title:", driver.title)
-        print("Current URL:", driver.current_url)
+        print("Current title:", get_driver_title_safe(driver))
+        print("Current URL:", get_driver_current_url_safe(driver))
 
         if PROMPT_BEFORE_RUN:
             print("Login ke liye browser ready hai.")

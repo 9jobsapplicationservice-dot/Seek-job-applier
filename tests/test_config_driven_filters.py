@@ -5,6 +5,7 @@ import os
 from SeekBot import (
     ACTIVE_JOB_CONTEXT,
     ACTIVE_APPLY_STATE,
+    answer_common_input_questions,
     append_apply_log,
     append_quick_apply_debug,
     build_client_context,
@@ -13,6 +14,7 @@ from SeekBot import (
     confirm_application_submission,
     detect_quick_apply,
     extract_browser_version,
+    extract_company_and_position,
     extract_experience_requirements,
     infer_job_role_relationship,
     parse_search_url_context,
@@ -34,11 +36,18 @@ from SeekBot import (
     is_security_verification_page,
     wait_for_security_verification,
     prepare_active_application,
+    rewrite_cover_letter_for_current_job,
     should_prepare_active_application,
     select_resume_if_present,
     switch_to_new_tab_if_any,
     verify_submission_artifacts,
     wait_for_manual_required_answers,
+    get_next_screenshot_path,
+    run_quick_apply_flow,
+    capture_job_start_screenshot,
+    is_job_start_screenshot_ready,
+    wait_for_job_start_screenshot_ready,
+    finalize_submission_screenshots,
 )
 from config import CONFIG
 
@@ -670,6 +679,120 @@ class ConfigDrivenFilterTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["row_count"], 1)
 
+    def test_get_next_screenshot_path_uses_datewise_numbering(self):
+        target_dir = os.path.join("logs", "screenshots", "2026-08-24", "before")
+        with mock.patch("SeekBot.get_screenshot_phase_dir", return_value=target_dir), mock.patch(
+            "SeekBot.os.listdir", side_effect=[[], ["1.png", "2.png", "note.txt"]]
+        ):
+            first_path = get_next_screenshot_path(phase="before")
+            third_path = get_next_screenshot_path(phase="before")
+
+        self.assertEqual(first_path, os.path.join(target_dir, "1.png"))
+        self.assertEqual(third_path, os.path.join(target_dir, "3.png"))
+
+    def test_is_job_start_screenshot_ready_requires_detail_page_title(self):
+        class Driver:
+            current_url = "https://www.seek.com.au/job/123"
+
+        with mock.patch("SeekBot.any_visible_selector", return_value=True):
+            self.assertTrue(is_job_start_screenshot_ready(Driver()))
+
+        Driver.current_url = "https://www.seek.com.au/job/123/apply"
+        with mock.patch("SeekBot.any_visible_selector", return_value=True):
+            self.assertFalse(is_job_start_screenshot_ready(Driver()))
+
+    def test_wait_for_job_start_screenshot_ready_waits_until_title_visible(self):
+        class Driver:
+            current_url = "https://www.seek.com.au/job/123"
+
+            def __init__(self):
+                self.scroll_calls = 0
+
+            def execute_script(self, script):
+                self.scroll_calls += 1
+
+        driver = Driver()
+        with mock.patch("SeekBot.is_job_start_screenshot_ready", side_effect=[False, False, True]), mock.patch(
+            "SeekBot.time.sleep"
+        ):
+            self.assertTrue(wait_for_job_start_screenshot_ready(driver, timeout=2))
+
+        self.assertGreaterEqual(driver.scroll_calls, 2)
+
+    def test_capture_job_start_screenshot_scrolls_to_top_before_capture(self):
+        class Driver:
+            def execute_script(self, script):
+                self.script = script
+
+        driver = Driver()
+        with mock.patch("SeekBot.wait_for_job_start_screenshot_ready", return_value=True) as mock_wait, mock.patch(
+            "SeekBot.capture_job_screenshot", return_value="before-shot.png"
+        ) as mock_capture, mock.patch("SeekBot.time.sleep") as mock_sleep:
+            result = capture_job_start_screenshot(driver, "job-1")
+
+        self.assertEqual(result, "before-shot.png")
+        self.assertEqual(driver.script, "window.scrollTo(0, 0);")
+        mock_wait.assert_called_once()
+        mock_sleep.assert_called_once_with(0.2)
+        mock_capture.assert_called_once_with(driver, "job-1", "before_apply", phase="pending_before")
+
+    def test_finalize_submission_screenshots_moves_before_to_matching_number(self):
+        class Driver:
+            pass
+
+        with mock.patch("SeekBot.ensure_log_paths"), mock.patch(
+            "SeekBot.get_next_screenshot_path", return_value=os.path.join("logs", "screenshots", "2026-08-24", "after", "1.png")
+        ), mock.patch(
+            "SeekBot.get_screenshot_phase_dir", return_value=os.path.join("logs", "screenshots", "2026-08-24", "before")
+        ), mock.patch(
+            "SeekBot.capture_job_screenshot_to_path", return_value=os.path.join("logs", "screenshots", "2026-08-24", "after", "1.png")
+        ), mock.patch("SeekBot.os.path.exists", return_value=True), mock.patch("SeekBot.os.replace") as mock_replace:
+            before_path, after_path = finalize_submission_screenshots(Driver(), os.path.join("temp", "pending.png"), "job-1")
+
+        self.assertEqual(before_path, os.path.join("logs", "screenshots", "2026-08-24", "before", "1.png"))
+        self.assertEqual(after_path, os.path.join("logs", "screenshots", "2026-08-24", "after", "1.png"))
+        mock_replace.assert_called_once_with(os.path.join("temp", "pending.png"), os.path.join("logs", "screenshots", "2026-08-24", "before", "1.png"))
+
+    def test_run_quick_apply_flow_does_not_capture_before_screenshot_on_submit_step(self):
+        class Driver:
+            current_url = "https://www.seek.com.au/apply"
+
+        artifact_state = {"before_screenshot": ""}
+        with mock.patch("SeekBot.refresh_active_apply_state"), mock.patch(
+            "SeekBot.classify_current_location", return_value="internal"
+        ), mock.patch("SeekBot.is_external_apply", return_value=False), mock.patch(
+            "SeekBot.is_application_submitted", side_effect=[False, False, True]
+        ), mock.patch(
+            "SeekBot.get_current_flow_phase", return_value="review_submit"
+        ), mock.patch(
+            "SeekBot.get_apply_page_signature", return_value="sig"
+        ), mock.patch(
+            "SeekBot.get_primary_action_name", return_value="SUBMIT_APPLICATION"
+        ), mock.patch(
+            "SeekBot.should_prepare_active_application", return_value=False
+        ), mock.patch(
+            "SeekBot.is_employer_questions_step", return_value=False
+        ), mock.patch(
+            "SeekBot.detect_and_lock_seek_apply_page", return_value=False
+        ), mock.patch(
+            "SeekBot.get_primary_action_selectors", return_value=["//button"]
+        ), mock.patch(
+            "SeekBot.any_visible_selector", return_value=True
+        ), mock.patch(
+            "SeekBot.get_submit_application_selectors", return_value=["//button"]
+        ), mock.patch(
+            "SeekBot.capture_job_screenshot"
+        ) as mock_capture, mock.patch(
+            "SeekBot.hard_submit_application", return_value=True
+        ), mock.patch(
+            "SeekBot.wait_for_step_progress", return_value=True
+        ), mock.patch("SeekBot.time.sleep"):
+            result = run_quick_apply_flow(Driver(), job_key="job-1", artifact_state=artifact_state)
+
+        self.assertEqual(result, "submitted")
+        self.assertEqual(artifact_state["before_screenshot"], "")
+        mock_capture.assert_not_called()
+
     def test_job_filters_reject_when_location_does_not_match_config(self):
         result = evaluate_configured_job_filters(
             "Project Coordinator",
@@ -755,6 +878,92 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             answers,
             ["I am writing to express my interest in the Project Coordinator at Fangda Australia Pty Ltd."],
         )
+
+    def test_rewrite_cover_letter_for_current_job_replaces_previous_company_and_role(self):
+        letter = rewrite_cover_letter_for_current_job(
+            "Hi,\n\nI am writing to express my interest in the Customer Service position at Courtside Melbourne.\n\nThank you.",
+            "ISS First Response",
+            "Customer Service Agent - Emergency Vehicle Response - Melbourne",
+        )
+        self.assertIn("Customer Service Agent - Emergency Vehicle Response - Melbourne at ISS First Response", letter)
+        self.assertNotIn("Courtside Melbourne", letter)
+
+    def test_extract_company_and_position_prefers_current_apply_page_over_fallback(self):
+        class Elem:
+            def __init__(self, text):
+                self.text = text
+
+        class Driver:
+            page_source = ""
+
+            def find_elements(self, by, value):
+                mapping = {
+                    "//*[@data-automation='job-detail-title']": [],
+                    "//*[@data-testid='job-title']": [],
+                    "//h1[normalize-space(.)!='']": [],
+                    "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'applying for')]/following::*[self::h1 or self::h2 or self::div or self::span][normalize-space(.)!=''][1]": [Elem("CUSTOMER SERVICE OFFICER")],
+                    "//*[@data-automation='advertiser-name']": [],
+                    "//*[@data-testid='advertiser-name']": [],
+                    "//a[contains(@href, '/companies/') and normalize-space(.)!='']": [],
+                    "//span[contains(@data-automation, 'advertiser') and normalize-space(.)!='']": [],
+                    "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'applying for')]/following::*[normalize-space(.)!=''][2]": [Elem("Countrywide Austral Pty Ltd")],
+                }
+                return mapping.get(value, [])
+
+        company, position = extract_company_and_position(Driver(), "Operations & Administrator Team")
+        self.assertEqual(company, "Countrywide Austral Pty Ltd")
+        self.assertEqual(position, "CUSTOMER SERVICE OFFICER")
+
+    def test_answer_common_input_questions_rewrites_existing_cover_letter_for_current_job(self):
+        class Elem:
+            text = ""
+
+            def __init__(self):
+                self.value = "Hi,\n\nI am writing to express my interest in the Customer Service position at Courtside Melbourne.\n\nThank you."
+
+            def is_displayed(self):
+                return True
+
+            def is_enabled(self):
+                return True
+
+            def get_attribute(self, name):
+                if name == "value":
+                    return self.value
+                return ""
+
+            def clear(self):
+                self.value = ""
+
+            def send_keys(self, value):
+                self.value = value
+
+        class Driver:
+            def __init__(self, elem):
+                self.elem = elem
+
+            def find_elements(self, by, value):
+                return [self.elem]
+
+            def execute_script(self, script, elem, *args):
+                if "closest('fieldset, section, form, div')" in script:
+                    return "Please add a cover letter or message to the employer"
+                if "el.value = value;" in script:
+                    elem.value = args[0]
+                return None
+
+        elem = Elem()
+        ACTIVE_JOB_CONTEXT["company_name"] = "ISS First Response"
+        ACTIVE_JOB_CONTEXT["position"] = "Customer Service Agent - Emergency Vehicle Response - Melbourne"
+        try:
+            changed = answer_common_input_questions(Driver(elem))
+        finally:
+            ACTIVE_JOB_CONTEXT["company_name"] = ""
+            ACTIVE_JOB_CONTEXT["position"] = ""
+        self.assertTrue(changed)
+        self.assertIn("ISS First Response", elem.value)
+        self.assertIn("Customer Service Agent - Emergency Vehicle Response - Melbourne", elem.value)
+        self.assertNotIn("Courtside Melbourne", elem.value)
 
     @mock.patch("SeekBot.SKIP_ALREADY_APPLIED", False)
     def test_previously_submitted_job_is_not_skipped_when_config_disables_it(self):

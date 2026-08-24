@@ -14,26 +14,18 @@ import threading
 # roles ke 100% jobs external sites par hote hain jisme quick apply nahi hota).
 # Example Test URL: "https://au.seek.com/data-entry-jobs-in-office-support/in-All-Sydney-NSW"
 SEARCH_URLS = [
-    "https://au.seek.com/customer-service-representative-jobs-in-call-centre-customer-service/in-All-Melbourne-VIC?salaryrange=0-&salarytype=annual",
-    "https://au.seek.com/customer-service-jobs-in-call-centre-customer-service/in-All-Melbourne-VIC?salaryrange=0-30000&salarytype=annual&worktype=243%2C244%2C245",
-    "https://au.seek.com/customer-service-representative-jobs-in-call-centre-customer-service/in-All-Melbourne-VIC?salaryrange=0-30000&salarytype=annual&worktype=243%2C244%2C245"
+"https://au.seek.com/construction-labourer-civil-construction-jobs-in-construction/in-All-Melbourne-VIC?salaryrange=0-30000&salarytype=annual&workarrangement=1%2C2&worktype=243%2C244%2C245"
 ]
 
 # 2. Desired Job Positions: Jo job roles aapko apply karne hain unke names
 DESIRED_POSITIONS = [
-    "Customer Service Officer",
-    "Call Centre Customer Service",
-    "Customer Service Representative",
-    "Customer Service Specialist",
-    "Customer Support Officer",
+    "Construction Labourer",
+   
 ]
 
 RELATED_POSITIONS = [
-    "customer service officer",
-    "call centre customer service",
-    "customer service representative",
-    "customer service specialist",
-    "customer support officer",
+    "Construction Labourer",
+  
 ]
 
 # 3. Job Location: Aapko kis city me job chahiye (Example: "Sydney", "Melbourne", "Brisbane")
@@ -103,13 +95,13 @@ CONFIG = {
         "search_urls": SEARCH_URLS,
         "startup_url": "https://www.seek.com.au/",
         "wait_timeout": 12,
-        "page_load_wait": 2.0,
-        "detail_load_wait": 1.5,
+        "page_load_wait": 1.2,
+        "detail_load_wait": 1.0,
         "flow_retry_limit": 4,
-        "click_pause": 0.6,
+        "click_pause": 0.35,
         "security_verification_timeout_sec": 25,
-        "security_verification_poll_sec": 1.5,
-        "post_verification_settle_wait_sec": 2.0,
+        "security_verification_poll_sec": 1.0,
+        "post_verification_settle_wait_sec": 1.0,
         "salary_tolerance": SALARY_TOLERANCE,
         "max_flow_steps": 20,
         "max_pages_per_search": 0,
