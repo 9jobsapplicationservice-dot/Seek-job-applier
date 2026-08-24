@@ -24,6 +24,8 @@ from SeekBot import (
     close_disallowed_seek_tabs,
     ensure_job_detail_page,
     evaluate_configured_job_filters,
+    evaluate_target_title,
+    normalize_title_text,
     find_local_chromedriver,
     find_seek_window_handle,
     MANUAL_QUESTION_TIMEOUT,
@@ -205,7 +207,7 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             "Quantity Surveyor / Senior Quantity Surveyor",
             "Ringwood Melbourne VIC Hybrid Full time $90,000 to $140,000 + super",
             required_keywords=["Quantity Surveyor"],
-            filters={"expected_salary": [80000], "job_type": ["full time"]},
+            filters={"expected_salary": [80000], "job_type": ["full time"], "enforce_expected_salary_ceiling": True},
         )
         self.assertFalse(result["eligible"])
         self.assertTrue(any("salary" in reason.lower() for reason in result["rejection_reasons"]))
@@ -246,6 +248,16 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             filters={"expected_salary": [120000], "job_type": ["full time"]},
         )
         self.assertTrue(result["eligible"])
+
+    def test_job_filters_allow_higher_salary_by_default(self):
+        result = evaluate_configured_job_filters(
+            "Project Engineer",
+            "Sydney full time role paying $121,000 plus super.",
+            required_keywords=["Project Engineer"],
+            filters={"expected_salary": [80000], "job_type": ["full time"]},
+        )
+        self.assertTrue(result["eligible"])
+
 
     def test_extract_experience_requirements_parses_range(self):
         info = extract_experience_requirements(
@@ -312,8 +324,8 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             client_id="software-client",
         )
         filter_result = evaluate_configured_job_filters(
-            "Backend Developer",
-            "Python SQL API backend developer with 3 years experience.",
+            "Junior Software Developer",
+            "Python SQL API software developer with 3 years experience.",
             required_keywords=["Software Developer"],
             filters={"job_type": [], "location": [], "experience": ["5 years"]},
         )
@@ -321,8 +333,8 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             "job-qa-sep",
             "https://au.seek.com/job/qa-sep",
             "Test Co",
-            "Backend Developer",
-            "Python SQL API backend developer with 3 years experience.",
+            "Junior Software Developer",
+            "Python SQL API software developer with 3 years experience.",
             filter_result,
             {"score": 12, "eligible": True, "matched_must_have": ["python"], "matched_preferred": ["api"], "missing_must_have": [], "excluded_term_hit": []},
             list_quick_apply=False,
@@ -783,6 +795,9 @@ class ConfigDrivenFilterTests(unittest.TestCase):
         ), mock.patch(
             "SeekBot.capture_job_screenshot"
         ) as mock_capture, mock.patch(
+            "SeekBot.revalidate_current_job_title_before_submit",
+            return_value={"title_match": True, "reason": "TARGET_TITLE_MATCH"},
+        ), mock.patch(
             "SeekBot.hard_submit_application", return_value=True
         ), mock.patch(
             "SeekBot.wait_for_step_progress", return_value=True
@@ -1478,13 +1493,14 @@ class ConfigDrivenFilterTests(unittest.TestCase):
         res = click_apply(drv, "https://www.seek.com.au/job/12345")
         self.assertEqual(res, "not_quick_apply")
 
-    def test_job_filters_lenient_keyword_match(self):
+    def test_job_filters_reject_title_mismatch_even_if_description_is_related(self):
         result = evaluate_configured_job_filters(
             "Estimator / Supervisor",
             "Full time role in Melbourne with construction background.",
             required_keywords=["Site Supervisor"],
         )
-        self.assertTrue(result["eligible"])
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["title_match_reason"], "SKIP_TITLE_MISMATCH")
 
     def test_job_filters_lenient_location_match(self):
         result = evaluate_configured_job_filters(
@@ -1509,10 +1525,170 @@ class ConfigDrivenFilterTests(unittest.TestCase):
             "Site Supervisor",
             "Paying $95,000 to $110,000 plus super.",
             required_keywords=["Site Supervisor"],
-            filters={"expected_salary": [80000]},
+            filters={"expected_salary": [80000], "enforce_expected_salary_ceiling": True},
         )
         self.assertFalse(result["eligible"])
         self.assertTrue(any("salary" in reason.lower() for reason in result["rejection_reasons"]))
+
+
+class StrictTitleMatcherTests(unittest.TestCase):
+    def test_construction_labourer_title_cases(self):
+        accepted_titles = [
+            "Construction Labourer",
+            "Civil Construction Labourer",
+            "Experienced Construction Labourer",
+            "Construction Labourer - Melbourne",
+            "Construction Site Labourer",
+            "General Construction Labourer",
+        ]
+        rejected_titles = [
+            "Multiskilled Operator",
+            "Plant Operator",
+            "Construction Manager",
+            "Site Supervisor",
+            "Project Manager",
+        ]
+        for title in accepted_titles:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=["Construction Labourer"],
+                    related_roles=["Construction Labourer"],
+                    filters={"keywords": ["Construction Labourer"], "related_roles": ["Construction Labourer"]},
+                )
+                self.assertTrue(result["title_match"])
+                self.assertEqual(result["reason"], "TARGET_TITLE_MATCH")
+        for title in rejected_titles:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=["Construction Labourer"],
+                    related_roles=["Construction Labourer"],
+                    filters={"keywords": ["Construction Labourer"], "related_roles": ["Construction Labourer"]},
+                )
+                self.assertFalse(result["title_match"])
+                self.assertEqual(result["reason"], "SKIP_TITLE_MISMATCH")
+
+    def test_data_analyst_title_cases(self):
+        accepted_titles = [
+            "Data Analyst",
+            "Junior Data Analyst",
+            "Data Analyst - Power BI",
+            "Data Analyst | Reporting",
+        ]
+        rejected_titles = [
+            "Data Engineer",
+            "Data Scientist",
+            "Business Analyst",
+            "Analytics Manager",
+            "Software Engineer",
+        ]
+        for title in accepted_titles:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=["Data Analyst"],
+                    related_roles=[],
+                    filters={"keywords": ["Data Analyst"], "related_roles": []},
+                )
+                self.assertTrue(result["title_match"])
+        for title in rejected_titles:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=["Data Analyst"],
+                    related_roles=[],
+                    filters={"keywords": ["Data Analyst"], "related_roles": []},
+                )
+                self.assertFalse(result["title_match"])
+
+    def test_software_developer_related_roles(self):
+        accepted_titles = [
+            ("Software Developer", "TARGET_TITLE_MATCH", "Software Developer"),
+            ("Junior Software Developer", "TARGET_TITLE_MATCH", "Software Developer"),
+            ("Software Engineer", "RELATED_ROLE_MATCH", "Software Engineer"),
+            ("Full Stack Developer", "RELATED_ROLE_MATCH", "Full Stack Developer"),
+        ]
+        rejected_titles = ["Data Engineer", "Project Manager", "Network Engineer"]
+        filters = {
+            "keywords": ["Software Developer"],
+            "related_roles": ["Software Engineer", "Full Stack Developer"],
+        }
+        for title, reason, matched_role in accepted_titles:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=filters["keywords"],
+                    related_roles=filters["related_roles"],
+                    filters=filters,
+                )
+                self.assertTrue(result["title_match"])
+                self.assertEqual(result["reason"], reason)
+                self.assertEqual(result["matched_role"], matched_role)
+        for title in rejected_titles:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=filters["keywords"],
+                    related_roles=filters["related_roles"],
+                    filters=filters,
+                )
+                self.assertFalse(result["title_match"])
+
+    def test_multiple_desired_positions_match_any_role(self):
+        filters = {
+            "keywords": ["Data Analyst", "Business Analyst", "Reporting Analyst"],
+            "related_roles": [],
+        }
+        result = evaluate_target_title(
+            "Senior Reporting Analyst",
+            required_keywords=filters["keywords"],
+            related_roles=filters["related_roles"],
+            filters=filters,
+        )
+        self.assertTrue(result["title_match"])
+        self.assertEqual(result["matched_role"], "Reporting Analyst")
+
+    def test_title_normalization_handles_formatting_and_spelling_variants(self):
+        variants = [
+            "Construction-Labourer",
+            "CONSTRUCTION LABOURER",
+            "Construction Labourer",
+            "Construction / Labourer",
+            "Construction Laborer",
+        ]
+        normalized = [normalize_title_text(value) for value in variants]
+        self.assertTrue(all(value == normalized[0] for value in normalized))
+        for title in variants:
+            with self.subTest(title=title):
+                result = evaluate_target_title(
+                    title,
+                    required_keywords=["Construction Labourer"],
+                    related_roles=[],
+                    filters={"keywords": ["Construction Labourer"], "related_roles": []},
+                )
+                self.assertTrue(result["title_match"])
+
+    def test_build_job_decision_title_mismatch_is_hard_fail(self):
+        filter_result = evaluate_configured_job_filters(
+            "Multiskilled Operator",
+            "Construction role in Melbourne with labour tasks and full time hours.",
+            required_keywords=["Construction Labourer"],
+            filters={"keywords": ["Construction Labourer"], "related_roles": ["Construction Labourer"], "job_type": ["full time"]},
+        )
+        decision = build_job_decision(
+            "job-title-gate",
+            "https://au.seek.com/job/title-gate",
+            "Test Co",
+            "Multiskilled Operator",
+            "Construction role in Melbourne with labour tasks and full time hours.",
+            filter_result,
+            {"score": 95, "eligible": True, "matched_must_have": [], "matched_preferred": [], "missing_must_have": [], "excluded_term_hit": []},
+            list_quick_apply=True,
+        )
+        self.assertEqual(decision["decision"], "SKIP")
+        self.assertIn("SKIP_TITLE_MISMATCH", decision["hard_fail_reasons"])
+
 
 
 if __name__ == "__main__":

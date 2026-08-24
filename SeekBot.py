@@ -110,6 +110,14 @@ MIN_JOB_MATCH_SCORE = int(MATCHING_CFG.get("min_job_match_score", 70))
 BORDERLINE_JOB_MATCH_SCORE = int(MATCHING_CFG.get("borderline_job_match_score", 60))
 ALLOW_UNKNOWN_SALARY = bool(MATCHING_CFG.get("allow_unknown_salary", True))
 ALLOW_RELATED_ROLES = bool(MATCHING_CFG.get("allow_related_roles", True))
+ENFORCE_EXPECTED_SALARY_CEILING = bool(MATCHING_CFG.get("enforce_expected_salary_ceiling", False))
+STRICT_TITLE_MATCH = bool(MATCHING_CFG.get("strict_title_match", True))
+TITLE_MATCH_HARD_GATE = bool(MATCHING_CFG.get("title_match_hard_gate", True))
+REQUIRE_TITLE_MATCH_BEFORE_APPLY = bool(MATCHING_CFG.get("require_title_match_before_apply", True))
+REVALIDATE_TITLE_BEFORE_SUBMIT = bool(MATCHING_CFG.get("revalidate_title_before_submit", True))
+CLASSIFICATION_IS_SEARCH_ONLY = bool(MATCHING_CFG.get("classification_is_search_only", True))
+ALLOW_LOOSE_TITLE_MATCH = bool(MATCHING_CFG.get("allow_loose_title_match", False))
+SKIP_TITLE_MISMATCH = bool(MATCHING_CFG.get("skip_title_mismatch", True))
 EXPERIENCE_STRICT = bool(MATCHING_CFG.get("experience_strict", True))
 
 LOG_DIR = os.path.join(os.getcwd(), "logs")
@@ -144,6 +152,15 @@ ROLE_STOP_TOKENS = {
     "jobs", "job", "in", "all", "nsw", "vic", "qld", "wa", "sa", "act", "nt", "australia",
     "sydney", "melbourne", "brisbane", "perth", "adelaide", "canberra", "engineering",
     "full", "time", "part", "casual", "contract", "temp"
+}
+TITLE_STOP_WORDS = {
+    "and", "or", "the", "a", "an", "of", "for", "in", "to", "with",
+    "on", "at", "by", "from", "as"
+}
+TITLE_LEVEL_TOKENS = ROLE_LEVEL_TOKENS.union({"experienced"})
+TITLE_TOKEN_VARIANTS = {
+    "laborer": "labourer",
+    "labor": "labour",
 }
 
 
@@ -638,6 +655,158 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalize_title_text(value):
+    text = str(value or "").lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[\/|+]+", " ", text)
+    text = re.sub(r"[()\[\]{}]", " ", text)
+    text = re.sub(r"[-_,.:;]+", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    tokens = []
+    for token in re.split(r"\s+", text):
+        cleaned = TITLE_TOKEN_VARIANTS.get(token, token)
+        if cleaned:
+            tokens.append(cleaned)
+    return " ".join(tokens).strip()
+
+
+def tokenize_title_for_matching(value, drop_levels=False, drop_stop_words=False):
+    tokens = []
+    for token in normalize_title_text(value).split():
+        if drop_levels and token in TITLE_LEVEL_TOKENS:
+            continue
+        if drop_stop_words and token in TITLE_STOP_WORDS:
+            continue
+        if len(token) <= 1:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def choose_best_target_role(role_text, desired_roles):
+    desired_roles = collect_string_list(desired_roles)
+    if not desired_roles:
+        return ""
+    role_tokens = set(tokenize_title_for_matching(role_text, drop_levels=True, drop_stop_words=True))
+    best_role = desired_roles[0]
+    best_score = -1.0
+    for desired_role in desired_roles:
+        desired_tokens = set(tokenize_title_for_matching(desired_role, drop_levels=True, drop_stop_words=True))
+        if not desired_tokens:
+            continue
+        overlap = len(role_tokens.intersection(desired_tokens))
+        score = overlap / max(1, len(desired_tokens))
+        if score > best_score:
+            best_score = score
+            best_role = desired_role
+    return best_role
+
+
+def title_role_match_details(actual_title, role_title, allow_loose=False):
+    actual_tokens = tokenize_title_for_matching(actual_title, drop_levels=True, drop_stop_words=True)
+    role_tokens = tokenize_title_for_matching(role_title, drop_levels=True, drop_stop_words=True)
+    actual_set = set(actual_tokens)
+    role_set = set(role_tokens)
+    overlap = actual_set.intersection(role_set)
+    normalized_actual = normalize_title_text(actual_title)
+    normalized_role = normalize_title_text(role_title)
+    exact_phrase = bool(normalized_actual and normalized_role and normalized_role in normalized_actual)
+    strict_match = bool(role_set) and role_set.issubset(actual_set)
+    loose_match = False
+    if allow_loose and not strict_match and len(role_set) >= 2:
+        missing = role_set.difference(actual_set)
+        loose_match = len(missing) <= 1 and len(overlap) / max(1, len(role_set)) >= 0.75
+    return {
+        "normalized_actual": normalized_actual,
+        "normalized_role": normalized_role,
+        "actual_tokens": actual_tokens,
+        "role_tokens": role_tokens,
+        "overlap_tokens": sorted(overlap),
+        "strict_match": strict_match,
+        "exact_phrase": exact_phrase,
+        "loose_match": loose_match,
+        "matched": strict_match or loose_match,
+    }
+
+
+def evaluate_target_title(actual_title, required_keywords=None, related_roles=None, filters=None):
+    filter_config = filters if isinstance(filters, dict) else JOB_FILTERS_CFG
+    desired_roles = collect_string_list(required_keywords if required_keywords is not None else filter_config.get("keywords", JOB_FILTER_REQUIRED_KEYWORDS))
+    configured_related_roles = collect_string_list(
+        related_roles if related_roles is not None else filter_config.get("related_roles", JOB_FILTER_RELATED_ROLES)
+    )
+    normalized_title = normalize_title_text(actual_title)
+    actual_tokens = tokenize_title_for_matching(actual_title, drop_levels=True, drop_stop_words=True)
+    result = {
+        "enabled": STRICT_TITLE_MATCH and bool(desired_roles or configured_related_roles),
+        "job_title": (actual_title or "").strip(),
+        "normalized_job_title": normalized_title,
+        "job_title_tokens": actual_tokens,
+        "target_role": choose_best_target_role(actual_title, desired_roles),
+        "matched_role": "",
+        "matched_role_type": "",
+        "title_match": True,
+        "decision": "CONTINUE",
+        "reason": "TITLE_MATCH_NOT_CONFIGURED",
+        "checked_roles": desired_roles + configured_related_roles,
+        "desired_roles": desired_roles,
+        "related_roles": configured_related_roles,
+        "allow_related_roles": ALLOW_RELATED_ROLES,
+        "allow_loose_title_match": ALLOW_LOOSE_TITLE_MATCH,
+        "classification_is_search_only": CLASSIFICATION_IS_SEARCH_ONLY,
+        "match_details": {},
+    }
+    if not result["enabled"]:
+        return result
+
+    for role in desired_roles:
+        details = title_role_match_details(actual_title, role, allow_loose=ALLOW_LOOSE_TITLE_MATCH)
+        if details["matched"]:
+            result.update({
+                "target_role": role,
+                "matched_role": role,
+                "matched_role_type": "desired",
+                "title_match": True,
+                "decision": "CONTINUE",
+                "reason": "TARGET_TITLE_MATCH",
+                "match_details": details,
+            })
+            return result
+
+    if ALLOW_RELATED_ROLES:
+        for role in configured_related_roles:
+            details = title_role_match_details(actual_title, role, allow_loose=ALLOW_LOOSE_TITLE_MATCH)
+            if details["matched"]:
+                result.update({
+                    "target_role": choose_best_target_role(role, desired_roles),
+                    "matched_role": role,
+                    "matched_role_type": "related",
+                    "title_match": True,
+                    "decision": "CONTINUE",
+                    "reason": "RELATED_ROLE_MATCH",
+                    "match_details": details,
+                })
+                return result
+
+    result.update({
+        "title_match": False,
+        "decision": "SKIP",
+        "reason": "SKIP_TITLE_MISMATCH",
+    })
+    return result
+
+
+def log_title_match_result(title_result):
+    if not title_result.get("enabled"):
+        return
+    print(f"JOB TITLE: {title_result.get('job_title', '')}")
+    print(f"TARGET ROLE: {title_result.get('target_role', '')}")
+    print(f"MATCHED ROLE: {title_result.get('matched_role', '')}")
+    print(f"TITLE MATCH: {'TRUE' if title_result.get('title_match') else 'FALSE'}")
+    print(f"DECISION: {title_result.get('decision', '')}")
+    print(f"REASON: {title_result.get('reason', '')}")
+
+
 def normalize_role_tokens(value):
     tokens = []
     for token in normalize_text(value).split():
@@ -964,21 +1133,31 @@ def evaluate_configured_job_filters(title_text, detail_text, required_keywords=N
     else:
         exclude_keywords = collect_string_list(exclude_keywords)
 
-    required_hits = find_lenient_hits(full_text, required_keywords)
+    title_match_result = evaluate_target_title(
+        title_text,
+        required_keywords=required_keywords,
+        related_roles=filter_config.get("related_roles", JOB_FILTER_RELATED_ROLES),
+        filters=filter_config,
+    )
     role_keywords = get_candidate_role_keywords(required_keywords)
     role_overlap = role_overlap_score(title_text, detail_text, role_keywords)
     excluded_hits = find_hits(full_text, exclude_keywords)
 
-    missing_required = [x for x in required_keywords if x not in required_hits]
+    required_hits = [title_match_result["matched_role"]] if title_match_result.get("title_match") and title_match_result.get("matched_role") else []
+    missing_required = [] if title_match_result.get("title_match") else list(required_keywords)
     rejection_reasons = []
 
     enabled = bool(required_keywords or exclude_keywords)
     has_required_match = True if not required_keywords else bool(required_hits)
-    if not has_required_match and role_overlap["score"] >= 0.5:
+    if STRICT_TITLE_MATCH and title_match_result.get("enabled"):
+        has_required_match = bool(title_match_result.get("title_match"))
+        if not has_required_match and SKIP_TITLE_MISMATCH:
+            rejection_reasons.append("title mismatch")
+    elif not has_required_match and role_overlap["score"] >= 0.5:
         has_required_match = True
         if role_overlap["best_match"]:
             required_hits.append(role_overlap["best_match"])
-    if not has_required_match:
+    if not has_required_match and "title mismatch" not in rejection_reasons:
         rejection_reasons.append("required keywords not matched")
     if excluded_hits:
         rejection_reasons.append("excluded keyword matched")
@@ -1013,6 +1192,9 @@ def evaluate_configured_job_filters(title_text, detail_text, required_keywords=N
 
     minimum_salary = get_first_numeric_value(filter_config.get("current_salary", []))
     expected_salary = get_first_numeric_value(filter_config.get("expected_salary", []))
+    enforce_expected_salary_ceiling = bool(
+        filter_config.get("enforce_expected_salary_ceiling", ENFORCE_EXPECTED_SALARY_CEILING)
+    )
     if minimum_salary and minimum_salary < 1000:
         minimum_salary *= 1000
     if expected_salary and expected_salary < 1000:
@@ -1024,7 +1206,7 @@ def evaluate_configured_job_filters(title_text, detail_text, required_keywords=N
         job_max_salary = max(annual_salaries)
         if minimum_salary is not None and job_max_salary < (minimum_salary - SALARY_TOLERANCE):
             rejection_reasons.append(f"job salary max {job_max_salary} is below min salary {minimum_salary}")
-        if expected_salary is not None and job_min_salary > (expected_salary + SALARY_TOLERANCE):
+        if enforce_expected_salary_ceiling and expected_salary is not None and job_min_salary > (expected_salary + SALARY_TOLERANCE):
             rejection_reasons.append(f"job salary min {job_min_salary} is above expected max salary {expected_salary}")
 
     eligible = not rejection_reasons
@@ -1039,7 +1221,12 @@ def evaluate_configured_job_filters(title_text, detail_text, required_keywords=N
         "matched_location": location_hits,
         "salary_numbers": salary_numbers,
         "role_overlap_score": role_overlap["score"],
-        "related_role_match": role_overlap["best_match"],
+        "related_role_match": title_match_result.get("matched_role") if title_match_result.get("matched_role_type") == "related" else role_overlap["best_match"],
+        "title_match": title_match_result.get("title_match"),
+        "target_role": title_match_result.get("target_role", ""),
+        "matched_role": title_match_result.get("matched_role", ""),
+        "title_match_reason": title_match_result.get("reason", ""),
+        "title_match_result": title_match_result,
         "rejection_reasons": rejection_reasons,
     }
 
@@ -1206,6 +1393,8 @@ def normalize_reason_code(reason):
     reason_text = normalize_text(reason).lower()
     if "required experience" in reason_text or "experience range" in reason_text:
         return "SKIP_EXPERIENCE_TOO_HIGH"
+    if "title mismatch" in reason_text:
+        return "SKIP_TITLE_MISMATCH"
     if "required keywords not matched" in reason_text:
         return "SKIP_ROLE_IRRELEVANT"
     if "excluded keyword matched" in reason_text:
@@ -1242,12 +1431,15 @@ def build_job_decision(
     salary_max = max(annual_salaries) if annual_salaries else None
 
     hard_fail_reasons = []
+    title_match_result = filter_result.get("title_match_result") or evaluate_target_title(title_text, filters=JOB_FILTERS_CFG)
     if duplicate:
         hard_fail_reasons.append("SKIP_DUPLICATE")
     if already_applied:
         hard_fail_reasons.append("SKIP_ALREADY_APPLIED")
     if external_apply:
         hard_fail_reasons.append("SKIP_EXTERNAL_APPLY")
+    if TITLE_MATCH_HARD_GATE and title_match_result.get("enabled") and not title_match_result.get("title_match"):
+        hard_fail_reasons.append("SKIP_TITLE_MISMATCH")
     for reason in filter_result.get("rejection_reasons", []):
         hard_fail_reasons.append(normalize_reason_code(reason))
 
@@ -1373,6 +1565,10 @@ def build_job_decision(
         "salary_status": salary_match,
         "location_match": location_ok,
         "job_type_match": job_type_ok,
+        "target_role": title_match_result.get("target_role", ""),
+        "matched_role": title_match_result.get("matched_role", ""),
+        "title_match": title_match_result.get("title_match", True),
+        "title_match_reason": title_match_result.get("reason", ""),
         "fit_decision": fit_decision,
         "quick_apply_available": bool(list_quick_apply),
         "application_method_status": application_method_status,
@@ -1421,6 +1617,13 @@ def log_job_decision(job_key, decision):
         f"application_method={decision.get('application_method_status', '')} "
         f"confidence={decision.get('confidence', 0)}"
     )
+    print(
+        "DECISION_TITLE:"
+        f"target_role={decision.get('target_role', '')} "
+        f"matched_role={decision.get('matched_role', '')} "
+        f"title_match={decision.get('title_match', True)} "
+        f"title_reason={decision.get('title_match_reason', '')}"
+    )
     if decision.get("hard_fail"):
         print(f"HARD_FAIL:{decision.get('hard_fail_reason', '')}")
 
@@ -1431,6 +1634,9 @@ def log_filter_result(job_key, title, filter_result):
     print(f"CONFIG_FILTER:key={job_key} eligible={filter_result['eligible']}")
     print(f"FILTER_TITLE:{title}")
     print(f"FILTER_MATCHED:{filter_result['matched_required']}")
+    print(f"FILTER_TITLE_MATCH:{filter_result.get('title_match')}")
+    print(f"FILTER_TARGET_ROLE:{filter_result.get('target_role', '')}")
+    print(f"FILTER_MATCHED_ROLE:{filter_result.get('matched_role', '')}")
     print(f"FILTER_MISSING:{filter_result['missing_required']}")
     print(f"FILTER_EXCLUDED:{filter_result['excluded_hits']}")
     print(f"FILTER_LOCATION:{filter_result.get('matched_location', [])}")
@@ -3379,6 +3585,10 @@ def append_evaluation_log(job_url, company_name, position, decision, reason, fil
         "filter_eligible",
         "filter_reasons",
         "matched_required",
+        "target_role",
+        "matched_role",
+        "title_match",
+        "title_match_reason",
         "related_role_match",
         "role_overlap_score",
         "salary_numbers",
@@ -3412,6 +3622,10 @@ def append_evaluation_log(job_url, company_name, position, decision, reason, fil
         "filter_eligible": "" if not filter_result else filter_result.get("eligible"),
         "filter_reasons": "" if not filter_result else "|".join(filter_result.get("rejection_reasons", [])),
         "matched_required": "" if not filter_result else "|".join(filter_result.get("matched_required", [])),
+        "target_role": "" if not filter_result else filter_result.get("target_role", ""),
+        "matched_role": "" if not filter_result else filter_result.get("matched_role", ""),
+        "title_match": "" if not filter_result else filter_result.get("title_match"),
+        "title_match_reason": "" if not filter_result else filter_result.get("title_match_reason", ""),
         "related_role_match": "" if not filter_result else filter_result.get("related_role_match", ""),
         "role_overlap_score": "" if not filter_result else filter_result.get("role_overlap_score", 0),
         "salary_numbers": "" if not filter_result else "|".join(str(x) for x in filter_result.get("salary_numbers", [])),
@@ -4115,6 +4329,13 @@ def wait_for_step_progress(driver, before_url, before_phase, before_action, befo
     return False
 
 
+def revalidate_current_job_title_before_submit(driver):
+    identity = get_current_job_identity(driver)
+    title_result = evaluate_target_title(identity.get("title", ""))
+    log_title_match_result(title_result)
+    return title_result
+
+
 def run_quick_apply_flow(driver, job_key="", artifact_state=None):
     idle_cycles = 0
     last_wait_log = 0
@@ -4179,6 +4400,10 @@ def run_quick_apply_flow(driver, job_key="", artifact_state=None):
                 elif step_name in ("SUBMIT_APPLICATION", "SUBMIT"):
                     print(f"FLOW_ADVANCE:primary_cta={step_name}")
                 clicked = False
+                if REVALIDATE_TITLE_BEFORE_SUBMIT and phase == "review_submit" and step_name in ("SUBMIT_APPLICATION", "SUBMIT"):
+                    final_title_check = revalidate_current_job_title_before_submit(driver)
+                    if not final_title_check.get("title_match"):
+                        return "title_mismatch_final_check"
                 if step_name == "SUBMIT_APPLICATION":
                     clicked = hard_submit_application(driver)
                 else:
@@ -4315,6 +4540,7 @@ def process_job_url(driver, job_entry, idx, stats):
             LAST_HR_TEXT = build_hr_context_text(driver, title_text, detail_text)
             LAST_HR_LINK = extract_hr_profile_link(driver)
             filter_result = evaluate_configured_job_filters(title_text, detail_text)
+            log_title_match_result(filter_result.get("title_match_result") or {})
             log_filter_result(job_key, title_text, filter_result)
 
             match_result = evaluate_match(title_text, detail_text)
@@ -4507,6 +4733,16 @@ def process_job_url(driver, job_entry, idx, stats):
                 stats["skipped_external"] += 1
                 append_evaluation_log(job_url, company_name, position, "SKIP", "skipped_external", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
                 append_apply_log(company_name, position, job_url, "skipped_external", "", "")
+                clear_active_apply_state()
+            elif result == "title_mismatch_final_check":
+                remove_screenshot_file(artifact_state.get("before_screenshot", ""))
+                print(f"SKIP_TITLE_MISMATCH_FINAL_CHECK:{job_key}")
+                stats["skipped_filtered"] += 1
+                decision_data = dict(decision_data)
+                decision_data["final_action"] = "SKIP_TITLE_MISMATCH_FINAL_CHECK"
+                decision_data["decision_reason"] = "SKIP_TITLE_MISMATCH_FINAL_CHECK"
+                append_evaluation_log(job_url, company_name, position, "SKIP", "SKIP_TITLE_MISMATCH_FINAL_CHECK", filter_result=filter_result, match_result=match_result, decision_data=decision_data)
+                append_apply_log(company_name, position, job_url, "skipped_title_mismatch_final_check", "", "")
                 clear_active_apply_state()
             elif result == "blocked_questions":
                 remove_screenshot_file(artifact_state.get("before_screenshot", ""))

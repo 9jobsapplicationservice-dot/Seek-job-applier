@@ -14,19 +14,26 @@ import threading
 # roles ke 100% jobs external sites par hote hain jisme quick apply nahi hota).
 # Example Test URL: "https://au.seek.com/data-entry-jobs-in-office-support/in-All-Sydney-NSW"
 SEARCH_URLS = [
-"https://au.seek.com/construction-labourer-civil-construction-jobs-in-construction/in-All-Melbourne-VIC?salaryrange=0-30000&salarytype=annual&workarrangement=1%2C2&worktype=243%2C244%2C245"
+"https://au.seek.com/customer-service-jobs-in-call-centre-customer-service/in-All-Melbourne-VIC?workarrangement=1%2C2&worktype=243%2C244%2C245",
+"https://au.seek.com/customer-service-representative-jobs-in-call-centre-customer-service/in-All-Melbourne-VIC?workarrangement=1%2C2&worktype=243%2C244%2C245",
+"https://au.seek.com/customer-service-officer-jobs-in-call-centre-customer-service/in-All-Melbourne-VIC?workarrangement=1%2C2&worktype=243%2C244%2C245"
 ]
 
 # 2. Desired Job Positions: Jo job roles aapko apply karne hain unke names
 DESIRED_POSITIONS = [
-    "Construction Labourer",
-   
+    "Customer Service Representative",
+    "Customer Service Officer",
 ]
 
 RELATED_POSITIONS = [
-    "Construction Labourer",
-  
+    "Costumer Service",
+    "Customer Support",
+    "Customer Service Assistant",
+    "Customer Service Associate",
+    "Customer Service Coordinator",
+    "Customer Service Consultant",
 ]
+    
 
 # 3. Job Location: Aapko kis city me job chahiye (Example: "Sydney", "Melbourne", "Brisbane")
 LOCATION = "Melbourne Victoria,Australia"
@@ -138,6 +145,11 @@ CONFIG = {
     },
     "matching": {
         "enabled": False,
+        "strict_title_match": True,
+        "title_match_hard_gate": True,
+        "require_title_match_before_apply": True,
+        "revalidate_title_before_submit": True,
+        "classification_is_search_only": True,
         "must_have_weight": 12,
         "preferred_weight": 4,
         "exclude_penalty": 20,
@@ -147,6 +159,9 @@ CONFIG = {
         "borderline_job_match_score": 60,
         "allow_unknown_salary": True,
         "allow_related_roles": True,
+        "allow_loose_title_match": False,
+        "skip_title_mismatch": True,
+        "enforce_expected_salary_ceiling": False,
         "experience_strict": True,
         "job_fit_weights": {
             "search_intent": 25,
@@ -160,7 +175,7 @@ CONFIG = {
     "apply": {
         "session_apply_cap": 0,
         "max_jobs_per_run": 0,
-        "quick_apply_only": True,
+        "quick_apply_only": False,
         "skip_external": True,
         "skip_already_applied": False,
         "auto_submit_enabled": True,
@@ -182,7 +197,7 @@ CONFIG = {
     "logging": {
         "show_match_details": True,
         "show_skip_reasons": True,
-        "enable_evaluation_csv": False,
+        "enable_evaluation_csv": True,
     },
 }
 
